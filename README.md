@@ -39,8 +39,9 @@ identification.
 
 ## Pin connections
 
-*(this section documents the wiring shown in the original `png2.pdf` circuit —
-adapt the `#define`s at the top of the sketch if your pins differ)*
+![Wiring diagram](docs/wiring_diagram.png)
+
+*(diagram sources: [`docs/wiring_diagram.svg`](docs/wiring_diagram.svg), regenerable PNG via `python3 docs/make_diagram.py` — adapt the `#define`s at the top of the sketch if your pins differ)*
 
 ```
  ESP32 / ESP8266 (3.3V!)                                 DS2502
