@@ -347,8 +347,9 @@ class App(tk.Tk):
             try:
                 fn()
             except Exception as exc:
-                self.log(f"ERROR: {exc}")
-                self.after(0, lambda: messagebox.showerror("Error", str(exc)))
+                msg = str(exc) or exc.__class__.__name__
+                self.log(f"ERROR: {msg}")
+                self.after(0, lambda m=msg: messagebox.showerror("Error", m))
             finally:
                 self.busy = False
         threading.Thread(target=worker, daemon=True).start()
