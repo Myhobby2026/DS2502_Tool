@@ -185,7 +185,7 @@ dot(62, 15)
 dot(66, 15)
 txt(56, 13.4, "gate node", 8.5, color=GREY, ha="right", style="italic")
 resistor_v(62, 15, 9.5, "")
-txt(60.6, 10.6, "R4 10k", 9, "bold", ha="right")
+txt(60.6, 10.6, "R4 1k", 9, "bold", ha="right")
 arrow_up(62, 9.5, "+12V", RED, side=True)
 # C1 470p
 wire([(66, 15), (66, 17.6)])
