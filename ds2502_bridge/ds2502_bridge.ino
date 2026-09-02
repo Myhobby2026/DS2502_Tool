@@ -1,67 +1,57 @@
 /*
  * ============================================================================
- *  DS2502 1-Wire EPROM Bridge  (ESP32 / ESP8266)
+ *  DS2502 1-Wire EPROM Bridge  (ESP32)  -  split-pin driver-board edition
  * ============================================================================
- *  Full READ + WRITE support for the DS2502 1Kb Add-Only Memory:
+ *  Matches the png2 driver schematic:
  *
- *    Data memory   : 128 bytes (4 pages x 32 bytes),  0x00 .. 0x7F
- *    Status memory : 8 bytes,                         0x00 .. 0x07
+ *    OW_TX  = GPIO25 - drive:  R2 1k -> Q1 2N7002 gate, Q1 drain on the bus.
+ *                      ** INVERTED **  GPIO25 HIGH = bus pulled LOW.
+ *    OW_RX  = GPIO26 - sense:  bus -> R3 10k -> GPIO26, BAT54S clamp
+ *                      (pin3 = GPIO26-side node of R3, pin1 = GND, pin2 = 3V3)
+ *                      so GPIO26 survives the 12 V VPP pulse.
+ *    OW_VPP = GPIO27 - 12 V enable: R5 1k -> Q3 2N7002 -> pulls the gate node
+ *                      (Q2.G + R4 1k pull-up + C1 470p) low -> Q2 AO3401A
+ *                      P-FET switches VPP (+11.75 V from MT3608) onto the bus.
+ *                      ** ACTIVE HIGH **  GPIO27 HIGH = 12 V on the bus.
  *
- *  Implemented 1-Wire memory-function commands (per DS2502 datasheet):
- *    Read Memory   [F0h]   - read data EPROM, CRC8 of cmd+address verified
- *    Read Status   [AAh]   - read status EPROM, CRC8 verified
- *    Write Memory  [0Fh]   - program data EPROM  (needs 12V program pulse)
- *    Write Status  [55h]   - program status EPROM(needs 12V program pulse)
- *    Read ROM      [33h]   - 64-bit ROM ID (family 0x09), CRC8 verified
+ *    Bus pull-up: R1 4.7k to 3V3.   DS2502 TO-92: 1=GND, 2=DATA, 3=NC.
  *
- *  WRITE PROTOCOL (exactly as in the datasheet flow chart):
- *    1st byte : master TX  cmd, TA1, TA2, data
- *               master RX  CRC8(cmd, TA1, TA2, data)      -> must match
- *               master applies 12V / 480us program pulse on DQ
- *               master RX  programmed byte                -> verify (EPROM AND)
- *    next byte: DS2502 auto-increments its address counter
- *               master TX  data
- *               master RX  CRC8 seeded with LSB of NEW address, then data
- *               program pulse, read-back verify ... and so on.
+ *    !! Set the MT3608 boost to 11.75 V (measured under load) BEFORE
+ *    !! connecting the DS2502. VPP must stay within 11.5 - 12.0 V.
  *
- *  NOTE: EPROM technology - bits can only be changed 1 -> 0, never back!
+ *  Read-only quick build (no 12 V, no driver parts):
+ *    set OW_USE_DRIVER 0 below -> single bidirectional pin (GPIO4) driven
+ *    open-drain, bus + 4.7k pull-up to 3V3. Reads work, writes are refused.
+ *
+ *  DS2502 protocol implemented (per datasheet):
+ *    Read ROM [33h], Read Memory [F0h], Read Status [AAh],
+ *    Write Memory [0Fh], Write Status [55h]  - full write flow with per-byte
+ *    CRC8 check, 480 us VPP pulse, read-back verify, auto-increment CRC rule.
  *
  * ----------------------------------------------------------------------------
  *  SERIAL PROTOCOL (115200 baud, line based, values in HEX):
- *
- *    PING                       -> OK PONG DS2502-BRIDGE v1.0
- *    ROM                        -> OK ROM 09xxxxxxxxxxxxCC
- *    RDATA <addr> <len>         -> OK DATA <hex bytes>
- *    RSTAT                      -> OK STAT <16 hex chars>          (8 bytes)
- *    WDATA <addr> <hexbytes>    -> BYTE ... lines, then OK WDATA <n>
- *    WSTAT <addr> <hexbytes>    -> BYTE ... lines, then OK WSTAT <n>
- *
- *    Any failure answers:  ERR <reason>
- *
- * ----------------------------------------------------------------------------
- *  PIN CONNECTIONS (see README.md / your png2.pdf 12V pulse circuit):
- *
- *    OW_PIN    GPIO4  (ESP8266 NodeMCU: D2) - 1-Wire DQ, 4.7k pullup to 3V3
- *    PROG_PIN  GPIO5  (ESP8266 NodeMCU: D1) - drives the 12V pulse switch
- *
- *    The PROG_PIN switches +12V onto the DQ line through your external
- *    transistor/MOSFET circuit. Set PROG_ACTIVE_HIGH below to match the
- *    polarity of that circuit (1 = pin HIGH turns 12V on).
- *
- *    !! The ESP32/ESP8266 is a 3.3V device. The DQ GPIO *must* be protected
- *    !! from the 12V pulse (series resistor + Schottky clamp to 3V3, or an
- *    !! equivalent arrangement) - see README.md.
+ *    PING / DIAG / SEARCH / ROM
+ *    RDATA <addr> <len>   RSTAT   WDATA <addr> <hex>   WSTAT <addr> <hex>
+ *  Answers: OK ... / ERR ... ; writes print one BYTE line per byte.
  * ============================================================================
  */
 
-#include <OneWire.h>
+#include <Arduino.h>
 
 /* ------------------------------- user config ----------------------------- */
-#define OW_PIN            4      // 1-Wire DQ line (ESP8266 NodeMCU: D2)
-#define PROG_PIN          5      // 12V program-pulse control (NodeMCU: D1)
-#define PROG_ACTIVE_HIGH  1      // 1: HIGH switches 12V on, 0: LOW switches on
-#define PROG_PULSE_US     500    // datasheet tPROG min = 480 us
-#define PROG_RECOVERY_US  100    // recovery after pulse before read-back
+#define OW_USE_DRIVER   1     /* 1 = split-pin driver board (png2 schematic) */
+                              /* 0 = read-only single-pin quick build        */
+
+#if OW_USE_DRIVER
+  #define OW_TX_PIN     25    /* drive  (inverting, via Q1 2N7002)           */
+  #define OW_RX_PIN     26    /* sense  (via R3 10k + BAT54S clamp)          */
+  #define OW_VPP_PIN    27    /* 12V enable (active HIGH, via Q3 + Q2)       */
+#else
+  #define OW_PIN        4     /* single bidirectional pin, open-drain        */
+#endif
+
+#define PROG_PULSE_US   500   /* datasheet tPROG min = 480 us                */
+#define PROG_RECOVERY_US 200  /* bus settle time after the VPP pulse         */
 
 /* ---------------------------- DS2502 constants --------------------------- */
 #define DS2502_FAMILY       0x09
@@ -69,18 +59,113 @@
 #define CMD_READ_STATUS     0xAA
 #define CMD_WRITE_MEMORY    0x0F
 #define CMD_WRITE_STATUS    0x55
-#define DATA_SIZE           0x80   // 128 bytes
-#define STATUS_SIZE         0x08   // 8 bytes
-
-OneWire ow(OW_PIN);
+#define DATA_SIZE           0x80
+#define STATUS_SIZE         0x08
 
 static char    lineBuf[600];
 static size_t  lineLen = 0;
 
-/* ------------------------------ small helpers ---------------------------- */
+/* ========================================================================== */
+/*  Low-level 1-Wire bit-bang layer                                           */
+/* ========================================================================== */
+#if OW_USE_DRIVER
 
-// Dallas/Maxim CRC8 (poly X^8+X^5+X^4+1, LSB first), with explicit seed.
-// Needed because subsequent write passes seed the CRC with the address LSB.
+/* Q1 is an inverting open-drain driver: TX HIGH -> bus LOW */
+static inline void busDriveLow(void) { digitalWrite(OW_TX_PIN, HIGH); }
+static inline void busRelease(void)  { digitalWrite(OW_TX_PIN, LOW);  }
+static inline int  busLevel(void)    { return digitalRead(OW_RX_PIN); }
+static inline void vppOff(void)      { digitalWrite(OW_VPP_PIN, LOW); }
+
+static void owPinsInit(void)
+{
+  pinMode(OW_VPP_PIN, OUTPUT); vppOff();        /* 12V OFF, first thing      */
+  pinMode(OW_TX_PIN,  OUTPUT); busRelease();
+  pinMode(OW_RX_PIN,  INPUT);
+}
+
+#else  /* ------- read-only single-pin build: open-drain on OW_PIN --------- */
+
+static inline void busDriveLow(void) { pinMode(OW_PIN, OUTPUT);
+                                       digitalWrite(OW_PIN, LOW); }
+static inline void busRelease(void)  { pinMode(OW_PIN, INPUT); }
+static inline int  busLevel(void)    { return digitalRead(OW_PIN); }
+static inline void vppOff(void)      { }
+
+static void owPinsInit(void)
+{
+  busRelease();
+}
+
+#endif
+
+/* Standard-speed 1-Wire timing (identical for both builds) */
+static bool owReset(void)
+{
+  busRelease();
+  delayMicroseconds(5);
+  noInterrupts();
+  busDriveLow();
+  delayMicroseconds(480);
+  busRelease();
+  delayMicroseconds(70);
+  bool presence = (busLevel() == LOW);
+  interrupts();
+  delayMicroseconds(410);
+  return presence;
+}
+
+static void owWriteBit(uint8_t b)
+{
+  noInterrupts();
+  if (b) { busDriveLow(); delayMicroseconds(6);  busRelease(); delayMicroseconds(64); }
+  else   { busDriveLow(); delayMicroseconds(60); busRelease(); delayMicroseconds(10); }
+  interrupts();
+}
+
+static uint8_t owReadBit(void)
+{
+  noInterrupts();
+  busDriveLow();
+  delayMicroseconds(6);
+  busRelease();
+  delayMicroseconds(9);                 /* sample ~15 us into the slot */
+  uint8_t b = busLevel() ? 1 : 0;
+  interrupts();
+  delayMicroseconds(55);
+  return b;
+}
+
+static void owWrite(uint8_t v)
+{
+  for (uint8_t i = 0; i < 8; i++) { owWriteBit(v & 0x01); v >>= 1; }
+}
+
+static uint8_t owRead(void)
+{
+  uint8_t v = 0;
+  for (uint8_t i = 0; i < 8; i++) v |= (owReadBit() << i);
+  return v;
+}
+
+static inline void owSkip(void) { owWrite(0xCC); }   /* Skip ROM */
+
+/* -------- 12 V programming pulse (driver build only) ---------------------- */
+#if OW_USE_DRIVER
+static bool progPulse(void)
+{
+  busRelease();                        /* bus MUST idle high before VPP      */
+  delayMicroseconds(5);
+  noInterrupts();
+  digitalWrite(OW_VPP_PIN, HIGH);      /* Q3 on -> Q2 gate low -> 12V on bus */
+  delayMicroseconds(PROG_PULSE_US);
+  digitalWrite(OW_VPP_PIN, LOW);
+  interrupts();
+  delayMicroseconds(PROG_RECOVERY_US); /* let bus fall back to 3V3 level    */
+  return true;
+}
+#endif
+
+/* ------------------------------ CRC8 (Dallas) ----------------------------- */
 static uint8_t crc8_update(uint8_t crc, uint8_t data)
 {
   for (uint8_t i = 0; i < 8; i++) {
@@ -98,24 +183,7 @@ static uint8_t crc8_buf(uint8_t crc, const uint8_t *buf, size_t len)
   return crc;
 }
 
-static void progPinIdle(void)
-{
-  digitalWrite(PROG_PIN, PROG_ACTIVE_HIGH ? LOW : HIGH);
-}
-
-/* Apply the 12V programming pulse on DQ via the external switch circuit.
- * The OneWire library leaves DQ released (input) after the last time slot,
- * so the line is idling high through the pullup when we hit it with 12V.  */
-static void programPulse(void)
-{
-  noInterrupts();
-  digitalWrite(PROG_PIN, PROG_ACTIVE_HIGH ? HIGH : LOW);
-  delayMicroseconds(PROG_PULSE_US);
-  progPinIdle();
-  interrupts();
-  delayMicroseconds(PROG_RECOVERY_US);
-}
-
+/* ------------------------------ small helpers ---------------------------- */
 static void printHexByte(uint8_t b)
 {
   if (b < 0x10) Serial.print('0');
@@ -127,96 +195,126 @@ static void printHexBuf(const uint8_t *buf, size_t len)
   for (size_t i = 0; i < len; i++) printHexByte(buf[i]);
 }
 
-/* -------------------------- 1-Wire transactions -------------------------- */
+/* ========================================================================== */
+/*  1-Wire ROM search (standard Maxim algorithm, works in both builds)        */
+/* ========================================================================== */
+static uint8_t srchRom[8];
+static int     srchLastDisc;
+static bool    srchDone;
 
-static bool busReset(void)
+static void searchInit(void)
 {
-  return ow.reset() == 1;
+  srchLastDisc = 0;
+  srchDone = false;
+  memset(srchRom, 0, sizeof(srchRom));
 }
 
-/* Read ROM [33h] - single device on the bus assumed. */
-static bool readROM(uint8_t rom[8], const char **err)
+static bool searchNext(void)
 {
-  if (!busReset()) { *err = "NO_DEVICE (no presence pulse)"; return false; }
-  ow.write(0x33);
-  for (uint8_t i = 0; i < 8; i++) rom[i] = ow.read();
-  if (OneWire::crc8(rom, 7) != rom[7]) { *err = "ROM_CRC"; return false; }
+  if (srchDone) return false;
+  if (!owReset()) { srchDone = true; return false; }
+  owWrite(0xF0);                                   /* Search ROM */
+  int lastZero = 0;
+  for (int pos = 1; pos <= 64; pos++) {
+    uint8_t idBit  = owReadBit();
+    uint8_t cmpBit = owReadBit();
+    uint8_t dir;
+    if (idBit && cmpBit) { srchDone = true; return false; }
+    if (idBit != cmpBit) {
+      dir = idBit;
+    } else {
+      if (pos < srchLastDisc)
+        dir = (srchRom[(pos - 1) >> 3] >> ((pos - 1) & 7)) & 1;
+      else
+        dir = (pos == srchLastDisc);
+      if (!dir) lastZero = pos;
+    }
+    if (dir) srchRom[(pos - 1) >> 3] |=  (1 << ((pos - 1) & 7));
+    else     srchRom[(pos - 1) >> 3] &= ~(1 << ((pos - 1) & 7));
+    owWriteBit(dir);
+  }
+  srchLastDisc = lastZero;
+  if (lastZero == 0) srchDone = true;
   return true;
 }
 
-/* Generic field read: cmd = F0h (data) or AAh (status).
- * Verifies the CRC8 of (cmd, TA1, TA2) that the DS2502 sends back.
- * If the read runs to the end of the field, the trailing CRC8 that the
- * DS2502 generates over all transferred data bytes is verified too.      */
+/* ========================================================================== */
+/*  DS2502 transactions                                                       */
+/* ========================================================================== */
+static bool readROM(uint8_t rom[8], const char **err)
+{
+  if (!owReset()) { *err = "NO_DEVICE (no presence pulse)"; return false; }
+  owWrite(0x33);
+  for (uint8_t i = 0; i < 8; i++) rom[i] = owRead();
+  if (crc8_buf(0, rom, 7) != rom[7]) { *err = "ROM_CRC"; return false; }
+  return true;
+}
+
 static bool readField(uint8_t cmd, uint16_t addr, uint16_t len,
                       uint16_t fieldSize, uint8_t *buf, const char **err)
 {
   if (len == 0 || addr + len > fieldSize) { *err = "RANGE"; return false; }
-  if (!busReset()) { *err = "NO_DEVICE (no presence pulse)"; return false; }
-  ow.skip();                                    // Skip ROM [CCh]
+  if (!owReset()) { *err = "NO_DEVICE (no presence pulse)"; return false; }
+  owSkip();
   uint8_t hdr[3] = { cmd, (uint8_t)(addr & 0xFF), (uint8_t)(addr >> 8) };
-  ow.write(hdr[0]); ow.write(hdr[1]); ow.write(hdr[2]);
+  owWrite(hdr[0]); owWrite(hdr[1]); owWrite(hdr[2]);
 
-  uint8_t crc = ow.read();
-  if (crc != crc8_buf(0, hdr, 3)) { busReset(); *err = "CMD_CRC"; return false; }
+  uint8_t crc = owRead();
+  if (crc != crc8_buf(0, hdr, 3)) { owReset(); *err = "CMD_CRC"; return false; }
 
-  for (uint16_t i = 0; i < len; i++) buf[i] = ow.read();
+  for (uint16_t i = 0; i < len; i++) buf[i] = owRead();
 
-  if (addr + len == fieldSize) {                // read the trailing data CRC
-    uint8_t dcrc = ow.read();
-    if (dcrc != crc8_buf(0, buf, len)) { busReset(); *err = "DATA_CRC"; return false; }
+  if (addr + len == fieldSize) {                 /* trailing data CRC */
+    uint8_t dcrc = owRead();
+    if (dcrc != crc8_buf(0, buf, len)) { owReset(); *err = "DATA_CRC"; return false; }
   }
-  busReset();
+  owReset();
   return true;
 }
 
-/* Generic EPROM write: cmd = 0Fh (data) or 55h (status).
- * Full datasheet flow with per-byte CRC check, 12V pulse and read-back.
- * Prints one "BYTE aaaa W=xx R=yy OK/PARTIAL" progress line per byte.     */
 static bool writeField(uint8_t cmd, uint16_t addr,
                        const uint8_t *data, uint16_t len,
                        uint16_t fieldSize, const char **err)
 {
+#if !OW_USE_DRIVER
+  (void)cmd; (void)addr; (void)data; (void)len; (void)fieldSize;
+  *err = "READ_ONLY_BUILD (OW_USE_DRIVER=0: no 12V driver hardware)";
+  return false;
+#else
   static char msg[64];
 
   if (len == 0 || addr + len > fieldSize) { *err = "RANGE"; return false; }
-  if (!busReset()) { *err = "NO_DEVICE (no presence pulse)"; return false; }
-  ow.skip();                                    // Skip ROM [CCh]
+  if (!owReset()) { *err = "NO_DEVICE (no presence pulse)"; return false; }
+  owSkip();
 
   for (uint16_t i = 0; i < len; i++) {
     uint16_t a = addr + i;
     uint8_t expect;
 
     if (i == 0) {
-      /* 1st pass: TX cmd, TA1, TA2, data - RX CRC8 of all four bytes */
       uint8_t hdr[4] = { cmd, (uint8_t)(a & 0xFF), (uint8_t)(a >> 8), data[i] };
-      ow.write(hdr[0]); ow.write(hdr[1]); ow.write(hdr[2]); ow.write(hdr[3]);
+      owWrite(hdr[0]); owWrite(hdr[1]); owWrite(hdr[2]); owWrite(hdr[3]);
       expect = crc8_buf(0, hdr, 4);
     } else {
-      /* subsequent passes: DS2502 has auto-incremented its address counter.
-       * TX data - RX CRC8 with the CRC generator *loaded* with the LSB of
-       * the new address, then the data byte shifted in.                   */
-      ow.write(data[i]);
+      /* DS2502 auto-incremented: CRC generator LOADED with new addr LSB */
+      owWrite(data[i]);
       expect = crc8_update((uint8_t)(a & 0xFF), data[i]);
     }
 
-    uint8_t crc = ow.read();
+    uint8_t crc = owRead();
     if (crc != expect) {
-      busReset();
+      owReset();
       snprintf(msg, sizeof(msg), "WRITE_CRC at %04X (got %02X want %02X)",
                a, crc, expect);
       *err = msg;
       return false;
     }
 
-    programPulse();                             // 12V, 480 us
+    progPulse();                                  /* 12 V, 480+ us */
 
-    uint8_t rb = ow.read();                     // read-back of programmed byte
-
-    /* EPROM semantics: byte is the logical AND of everything ever written.
-     * Success = every 0-bit we asked for is now 0.                        */
-    if ((rb & (uint8_t)~data[i]) != 0) {
-      busReset();
+    uint8_t rb = owRead();                        /* programmed byte */
+    if ((rb & (uint8_t)~data[i]) != 0) {          /* EPROM AND semantics */
+      owReset();
       snprintf(msg, sizeof(msg), "VERIFY at %04X (wrote %02X read %02X)",
                a, data[i], rb);
       *err = msg;
@@ -227,16 +325,17 @@ static bool writeField(uint8_t cmd, uint16_t addr,
     printHexByte((uint8_t)(a >> 8)); printHexByte((uint8_t)(a & 0xFF));
     Serial.print(F(" W=")); printHexByte(data[i]);
     Serial.print(F(" R=")); printHexByte(rb);
-    /* rb may have extra 0 bits from earlier programming - flag it */
     Serial.println(rb == data[i] ? F(" OK") : F(" OK(AND)"));
   }
 
-  busReset();
+  owReset();
   return true;
+#endif
 }
 
-/* ------------------------------ cmd handlers ----------------------------- */
-
+/* ========================================================================== */
+/*  command parsing                                                           */
+/* ========================================================================== */
 static bool parseHex(const char *s, uint32_t *out)
 {
   if (!s || !*s) return false;
@@ -245,7 +344,6 @@ static bool parseHex(const char *s, uint32_t *out)
   return *end == '\0';
 }
 
-/* Parse a hex string ("A0FF01" or "A0 FF 01") into bytes. */
 static int parseHexBytes(char *s, uint8_t *buf, int maxLen)
 {
   int n = 0;
@@ -271,7 +369,6 @@ static int parseHexBytes(char *s, uint8_t *buf, int maxLen)
 
 static void handleLine(char *line)
 {
-  /* tokenize */
   char *save = NULL;
   char *cmd  = strtok_r(line, " \t", &save);
   if (!cmd) return;
@@ -282,61 +379,66 @@ static void handleLine(char *line)
 
   /* ---- PING ---- */
   if (!strcmp(cmd, "PING")) {
-    Serial.println(F("OK PONG DS2502-BRIDGE v1.0"));
+#if OW_USE_DRIVER
+    Serial.println(F("OK PONG DS2502-BRIDGE v2.0 driver(TX25/RX26/VPP27)"));
+#else
+    Serial.println(F("OK PONG DS2502-BRIDGE v2.0 read-only(GPIO4)"));
+#endif
     return;
   }
 
-  /* ---- DIAG : 1-Wire bus health check ---- */
+  /* ---- DIAG : bus health check ---- */
   if (!strcmp(cmd, "DIAG")) {
-    /* 1. idle level of DQ (must be HIGH through the 4.7k pull-up) */
-    pinMode(OW_PIN, INPUT);
+    busRelease();
+    vppOff();
     delayMicroseconds(100);
-    int idle = digitalRead(OW_PIN);
+    int idle = busLevel();
     Serial.print(F("DQ idle level: "));
     Serial.println(idle
-      ? F("HIGH - good (pull-up working)")
-      : F("LOW  - BAD! short to GND, missing 4.7k pull-up, or DS2502 GND/DQ swapped"));
+      ? F("HIGH - good (R1 pull-up working)")
+      : F("LOW  - BAD! short, missing R1 4.7k pull-up, or DS2502 GND/DATA swapped"));
 
-    /* 2. can we pull the line low and does it come back up? */
-    pinMode(OW_PIN, OUTPUT);
-    digitalWrite(OW_PIN, LOW);
-    delayMicroseconds(60);
-    pinMode(OW_PIN, INPUT);
+    busDriveLow();
+    delayMicroseconds(30);
+    int drv = busLevel();
+    busRelease();
     delayMicroseconds(100);
-    int rel = digitalRead(OW_PIN);
-    Serial.print(F("DQ release test: "));
-    Serial.println(rel
-      ? F("returns HIGH - good")
-      : F("stays LOW - BAD! line stuck (short or wrong pin)"));
+    int rel = busLevel();
+    Serial.print(F("Drive test: "));
+#if OW_USE_DRIVER
+    Serial.println(!drv && rel
+      ? F("TX pulls bus LOW, releases HIGH - good (Q1/R2/R3 path OK)")
+      : (drv ? F("bus did NOT go low - BAD! check GPIO25->R2->Q1 gate, Q1 S to GND, Q1 D to bus")
+             : F("bus stuck LOW after release - BAD! Q1 always on or short")));
+#else
+    Serial.println(!drv && rel ? F("OK") : F("FAILED - line stuck"));
+#endif
 
-    /* 3. presence pulse, tried 3x */
     uint8_t hits = 0;
-    for (uint8_t i = 0; i < 3; i++) { if (ow.reset()) hits++; delay(2); }
+    for (uint8_t i = 0; i < 3; i++) { if (owReset()) hits++; delay(2); }
     Serial.print(F("Presence pulse: "));
     Serial.print(hits); Serial.println(F("/3 resets answered"));
     if (!hits) {
       Serial.println(F("-> no device: check DS2502 pinout (TO-92 flat face"));
-      Serial.println(F("   toward you, legs down: 1=GND 2=DQ 3=NC), the"));
-      Serial.println(F("   pull-up, and that OW_PIN matches your wiring"));
-      Serial.println(F("   (OW_PIN 4 = GPIO4 = NodeMCU 'D2', NOT 'D4'!)"));
+      Serial.println(F("   front: 1=GND 2=DATA 3=NC) and that DATA is on the bus"));
     }
 
     Serial.print(F("OK DIAG IDLE=")); Serial.print(idle);
+    Serial.print(F(" DRIVELOW="));    Serial.print(drv ? 0 : 1);
     Serial.print(F(" RELEASE="));     Serial.print(rel);
     Serial.print(F(" PRESENCE="));    Serial.println(hits);
     return;
   }
 
-  /* ---- SEARCH : enumerate every device on the bus ---- */
+  /* ---- SEARCH ---- */
   if (!strcmp(cmd, "SEARCH")) {
-    uint8_t rom[8];
     uint8_t n = 0;
-    ow.reset_search();
-    while (ow.search(rom)) {
+    searchInit();
+    while (searchNext()) {
       Serial.print(F("DEV "));
-      printHexBuf(rom, 8);
-      Serial.print(OneWire::crc8(rom, 7) == rom[7] ? F(" CRC=OK") : F(" CRC=BAD"));
-      if (rom[0] == DS2502_FAMILY) Serial.print(F(" (DS2502)"));
+      printHexBuf(srchRom, 8);
+      Serial.print(crc8_buf(0, srchRom, 7) == srchRom[7] ? F(" CRC=OK") : F(" CRC=BAD"));
+      if (srchRom[0] == DS2502_FAMILY) Serial.print(F(" (DS2502)"));
       Serial.println();
       n++;
     }
@@ -390,7 +492,7 @@ static void handleLine(char *line)
   if (wdata || wstat) {
     uint32_t addr;
     char *a = strtok_r(NULL, " \t", &save);
-    char *h = strtok_r(NULL, "",   &save);     // rest of line = hex payload
+    char *h = strtok_r(NULL, "",   &save);
     if (!a || !parseHex(a, &addr) || !h) { Serial.println(F("ERR ARG")); return; }
     int n = parseHexBytes(h, buf, sizeof(buf));
     if (n <= 0) { Serial.println(F("ERR HEX")); return; }
@@ -410,14 +512,17 @@ static void handleLine(char *line)
 }
 
 /* --------------------------------- setup --------------------------------- */
-
 void setup()
 {
-  pinMode(PROG_PIN, OUTPUT);
-  progPinIdle();                 // make absolutely sure 12V is OFF
+  owPinsInit();                 /* VPP forced OFF before anything else */
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("# DS2502 bridge ready (PING/DIAG/SEARCH/ROM/RDATA/RSTAT/WDATA/WSTAT)"));
+  Serial.println(F("# DS2502 bridge v2.0 ready (PING/DIAG/SEARCH/ROM/RDATA/RSTAT/WDATA/WSTAT)"));
+#if OW_USE_DRIVER
+  Serial.println(F("# driver build: OW_TX=GPIO25 OW_RX=GPIO26 OW_VPP=GPIO27"));
+#else
+  Serial.println(F("# read-only build: OW_PIN=GPIO4 (writes disabled)"));
+#endif
 }
 
 void loop()
@@ -433,7 +538,7 @@ void loop()
     } else if (lineLen < sizeof(lineBuf) - 1) {
       lineBuf[lineLen++] = c;
     } else {
-      lineLen = 0;               // overflow - drop the line
+      lineLen = 0;
       Serial.println(F("ERR LINE_TOO_LONG"));
     }
   }

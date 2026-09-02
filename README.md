@@ -6,7 +6,7 @@ identification.
 
 | Component | File | Role |
 |---|---|---|
-| Bridge firmware | [`ds2502_bridge/ds2502_bridge.ino`](ds2502_bridge/ds2502_bridge.ino) | ESP32 / ESP8266, drives the 1-Wire bus + 12V program pulse |
+| Bridge firmware | [`ds2502_bridge/ds2502_bridge.ino`](ds2502_bridge/ds2502_bridge.ino) | ESP32 + driver board: split-pin 1-Wire (TX/RX) + 12V VPP switch |
 | Desktop GUI | [`ds2502_gui.py`](ds2502_gui.py) | Python/Tkinter app talking to the bridge over USB serial |
 
 ## Features
@@ -37,64 +37,54 @@ identification.
 | `05h`–`06h` | Reserved (`FFh`) |
 | `07h` | Factory programmed `00h` |
 
-## Pin connections
+## Pin connections (driver board, png2 schematic)
 
 ![Wiring diagram](docs/wiring_diagram.png)
 
-*(diagram sources: [`docs/wiring_diagram.svg`](docs/wiring_diagram.svg), regenerable PNG via `python3 docs/make_diagram.py` — adapt the `#define`s at the top of the sketch if your pins differ)*
+*(regenerate the PNG with `python3 docs/make_diagram.py`)*
 
-```
- ESP32 / ESP8266 (3.3V!)                                 DS2502
- ─────────────────────────                              ────────
-                                     3V3
-                                      │
-                                     ┌┴┐
-                                     │ │ 4.7kΩ  (1-Wire pullup)
-                                     └┬┘
- GPIO4 (NodeMCU D2) ──[470Ω]──●──────┴──────────●────── DQ (pin 2)
-   1-Wire DQ                  │                 │
-                        BAT54 ▼ (clamp          │
-                        to 3V3, protects        │
-                        GPIO from 12V)          │
-                                                │
- GPIO5 (NodeMCU D1) ───► 12V pulse switch ──────┘
-   PROG control          (PNP/P-MOSFET high-side
-                          switch from +12V rail,
-                          e.g. NPN level shifter
-                          + P-MOSFET; ~480µs pulse)
+| ESP32 pin | Firmware name | Connects to | Function |
+|---|---|---|---|
+| **GPIO25** | `OW_TX_PIN` | R2 1 kΩ → Q1 (2N7002) gate; Q1 drain → bus, source → GND | Bus **drive** — **inverting**: GPIO HIGH = bus LOW |
+| **GPIO26** | `OW_RX_PIN` | bus → R3 10 kΩ → GPIO26, D3 BAT54S clamp on the GPIO-side node (pin 3 = node, pin 2 → 3V3, pin 1 → GND) | Bus **sense** — clamped to 0–3.6 V, survives the 12 V pulse |
+| **GPIO27** | `OW_VPP_PIN` | R5 1 kΩ → Q3 (2N7002) gate; Q3 drain pulls Q2 (AO3401A) gate node (R4 gate pull-up to +12 V, C1 470 p) low; Q2: S → +12 V, D → bus | **12 V enable** — active HIGH |
+| **3V3** | — | R1 4.7 kΩ → bus | 1-Wire pull-up |
+| **VIN 5V / USB** | — | MT3608 boost IN+ | source for the VPP supply |
+| **GND** | — | common ground (ESP32, DS2502, MT3608) | |
 
- GND ───────────────────────────────────────────●────── GND (pin 1)
-                                                │
- +12V supply GND ───────────────────────────────┘
-```
+DS2502 TO-92, flat face toward you, legs down: **1 = GND · 2 = DATA · 3 = NC**.
+Other packages — SO-8: DATA = pin 3, GND = pin 4 · TSOC: GND = 1, DATA = 2 ·
+SOT-23: DATA = 1, GND = 2 & 3.
 
 Notes:
 
-* The DS2502 is parasite-powered — only **DQ** and **GND** are connected.
-* **Programming needs a clean 11.5–12V pulse (480 µs)** on DQ. The bridge
-  raises `PROG_PIN` for 500 µs; your external transistor/MOSFET circuit
-  switches +12V onto the DQ line during that time.
-* The ESP GPIO must survive the 12V pulse — the series resistor + Schottky
-  clamp above (or an equivalent from your circuit) is **mandatory** on a
-  3.3V MCU.
-* Set `PROG_ACTIVE_HIGH` in the sketch to match your switch polarity
-  (default: pin HIGH = 12V on). The pin is driven to its idle level in
-  `setup()` so 12V is never applied accidentally.
+* The DS2502 is parasite-powered — only **DATA** and **GND** are connected.
+* **VPP:** set the MT3608 boost to **11.75 V measured under load** *before*
+  connecting the DS2502. Valid programming window 11.5–12.0 V;
+  **12.0 V is the absolute maximum**.
+* The firmware drives `OW_VPP_PIN` LOW in `setup()` before anything else, so
+  12 V is never applied accidentally.
 * **Never** put other (non-EPROM) 1-Wire devices on the bus while
-  programming — 12V will damage them.
+  programming — 12 V will damage them.
+* **Read-only quick build** (no 12 V, no driver parts): set
+  `OW_USE_DRIVER 0` in the sketch → single pin **GPIO4** open-drain to the
+  bus + 4.7 kΩ pull-up to 3V3, GND common. Reads work, writes are refused.
+* ESP32-S2/S3 don't have GPIO25 — pick different pins and change the
+  `#define`s.
 
 ## Bridge — build & flash
 
-1. Arduino IDE (or `arduino-cli`) with the ESP32/ESP8266 core installed
-2. Install the **OneWire** library (Paul Stoffregen) via Library Manager
-3. Open `ds2502_bridge/ds2502_bridge.ino`, check `OW_PIN`, `PROG_PIN`,
-   `PROG_ACTIVE_HIGH`, then flash. Serial monitor: **115200 baud**.
+1. Arduino IDE (or `arduino-cli`) with the **ESP32** core installed —
+   no external libraries needed (the 1-Wire layer is bit-banged in the sketch)
+2. Open `ds2502_bridge/ds2502_bridge.ino`, check `OW_USE_DRIVER`,
+   `OW_TX_PIN` (25), `OW_RX_PIN` (26), `OW_VPP_PIN` (27), then flash.
+   Serial monitor: **115200 baud**.
 
 ### Serial protocol (usable manually from any terminal)
 
 ```
-PING                     -> OK PONG DS2502-BRIDGE v1.0
-DIAG                     -> bus health report, then OK DIAG IDLE=1 RELEASE=1 PRESENCE=3
+PING                     -> OK PONG DS2502-BRIDGE v2.0 driver(TX25/RX26/VPP27)
+DIAG                     -> bus health report, then OK DIAG IDLE=1 DRIVELOW=1 RELEASE=1 PRESENCE=3
 SEARCH                   -> DEV <rom> lines, then OK SEARCH <count>
 ROM                      -> OK ROM 09A1B2C3D4E5F607
 RDATA <addr> <len>       -> OK DATA 55AA...        (hex, addr/len in hex)
@@ -112,22 +102,26 @@ The serial link is fine (`PING` works) but nothing answered the 1-Wire reset.
 Use the **Diagnose bus** button in the GUI (or send `DIAG` / `SEARCH` from a
 serial terminal) and check, in order of likelihood:
 
-1. **Wrong pin.** `OW_PIN 4` means **GPIO4**. On a NodeMCU/ESP8266 that is the
-   pin silk-screened **D2** — *not* D4 (D4 is GPIO2!). On an ESP32 DevKit the
-   pin is labeled `4` / `G4` / `P4`.
-2. **Missing pull-up.** Without the 4.7 kΩ from DQ to **3V3** the line can't
-   idle high and no presence pulse is possible. A multimeter on DQ should
-   read ≈ 3.3 V when idle (`DIAG` reports this as *DQ idle level*).
+1. **Wrong pins / wrong build.** Driver board: `OW_TX` = **GPIO25**,
+   `OW_RX` = **GPIO26**, `OW_VPP` = **GPIO27** and `OW_USE_DRIVER 1` in the
+   sketch. Simple single-pin build: `OW_USE_DRIVER 0` and the bus on
+   **GPIO4**. Flashing the wrong build for your hardware = guaranteed
+   `NO_DEVICE`.
+2. **Missing pull-up.** Without R1 4.7 kΩ from the bus to **3V3** the line
+   can't idle high and no presence pulse is possible. A multimeter on the bus
+   should read ≈ 3.3 V when idle (`DIAG` reports this as *DQ idle level*).
 3. **DS2502 pinout / orientation.** TO-92 with the **flat face toward you,
-   legs down: 1 = GND (left), 2 = DQ (middle), 3 = NC (right)**. GND and DQ
-   swapped = permanent "no presence".
-4. **12 V switch leaking or inverted.** DQ must sit at ~3.3 V idle — if you
-   measure ~12 V, Q2 is on: check `PROG_ACTIVE_HIGH` matches your circuit and
-   that R4 (gate pull-up to +12 V) is fitted. A DS2502 held at 12 V for a long
-   time may be damaged.
-5. **Isolate.** Temporarily disconnect the 12 V pulse circuit and wire just
-   DS2502 + pull-up to the ESP. If presence appears, the fault is in the
-   pulse switch; reads work fine without the 12 V section connected.
+   legs down: 1 = GND (left), 2 = DATA (middle), 3 = NC (right)**. GND and
+   DATA swapped = permanent "no presence".
+4. **Driver path broken.** `DIAG`'s *Drive test* exercises
+   GPIO25 → R2 → Q1 → bus → R3 → GPIO26. If the bus won't go LOW, check Q1's
+   pinout (2N7002 SOT-23: 1 = G, 2 = S, 3 = D), R2, and that Q1's source is
+   grounded. If it won't come back HIGH, Q1 is stuck on or the bus is shorted.
+5. **12 V switch leaking.** The bus must sit at ~3.3 V idle — if you measure
+   ~11.75 V, Q2 is on: check R4 (Q2 gate pull-up to +12 V) is fitted and Q3
+   isn't shorted. A DS2502 held at 12 V continuously may be damaged.
+6. **Isolate.** Disconnect the MT3608/12 V section — reads need no 12 V. If
+   presence appears, the fault is in the VPP switch.
 
 ## GUI — run
 
