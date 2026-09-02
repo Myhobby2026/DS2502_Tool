@@ -30,16 +30,27 @@ identification.
 
 ## Cloning a chip 1:1
 
-Use the **Clone chip …** button. Guided flow:
+Everything lives in the **Cloning** tab:
 
-1. Reads the ORIGINAL chip completely (ROM + 128 B data + 8 B status)
-2. Prompts you to swap in the new (blank) chip
-3. Safety checks: refuses if the original is still connected (same ROM ID)
-   or if the target already has 0-bits where the original has 1-bits
-4. Writes the data memory, verifies all 128 bytes
-5. Writes the status register — redirection bytes **first**, the
+* **Clone chip (guided)** — reads the ORIGINAL completely (ROM + 128 B data +
+  8 B status), prompts you to swap chips, then writes and verifies.
+* **Read chip → Save clone dump …** — archives the chip into a single
+  `.ds2502` file (JSON: ROM + data + status). Keep it as a backup.
+* **Load clone dump → Write to chip …** — clones from the file, no original
+  needed. Plain 128-byte `.bin` files are accepted too (data only).
+
+Every clone/dump action also refreshes the *Data memory* hex table and the
+decoded *Status register* view, so you always see exactly what was read or
+burned.
+
+Safety built in:
+
+1. Refuses if the source chip is still connected (same ROM ID)
+2. Refuses if the target already has 0-bits where the source has 1-bits
+3. Data is written first and verified byte-for-byte (128/128)
+4. Status is written **after** the data — redirection bytes first, the
    write-protect byte `00h` **last** (locking pages first would make the
-   data unwritable!) — then verifies bytes `00h`–`06h`
+   data unwritable!) — then verified
 
 > The 64-bit **ROM ID cannot be cloned** — it is factory-lasered and unique
 > per chip. Data + status are copied bit-perfect; if the host system

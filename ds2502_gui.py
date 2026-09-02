@@ -26,6 +26,7 @@
 ============================================================================
 """
 
+import json
 import threading
 import time
 import tkinter as tk
@@ -166,8 +167,6 @@ class App(tk.Tk):
             .pack(side="left", padx=12)
         ttk.Button(bar, text="Diagnose bus", command=self.do_diag)\
             .pack(side="left", padx=2)
-        ttk.Button(bar, text="Clone chip \u2026", command=self.do_clone)\
-            .pack(side="left", padx=2)
         self.lbl_rom = ttk.Label(bar, text="ROM: --", font=("Consolas", 10))
         self.lbl_rom.pack(side="left", padx=4)
 
@@ -176,10 +175,13 @@ class App(tk.Tk):
         nb.pack(fill="both", expand=True, padx=8, pady=4)
         self.tab_data = ttk.Frame(nb)
         self.tab_stat = ttk.Frame(nb)
+        self.tab_clone = ttk.Frame(nb)
         nb.add(self.tab_data, text="  Data memory (128 B EPROM)  ")
         nb.add(self.tab_stat, text="  Status register (8 B)  ")
+        nb.add(self.tab_clone, text="  Cloning  ")
         self._build_data_tab()
         self._build_status_tab()
+        self._build_clone_tab()
 
         # --- log --------------------------------------------------------------
         logf = ttk.LabelFrame(self, text="Log")
@@ -296,6 +298,60 @@ class App(tk.Tk):
         ttk.Button(row, text="WRITE status", command=self.do_write_status)\
             .pack(side="left", padx=10)
 
+    def _build_clone_tab(self):
+        t = self.tab_clone
+
+        g = ttk.LabelFrame(t, text="Guided clone: original chip \u2192 new chip "
+                                   "(read \u2192 swap \u2192 write \u2192 verify)")
+        g.pack(fill="x", padx=6, pady=8)
+        row = ttk.Frame(g)
+        row.pack(fill="x", padx=6, pady=6)
+        ttk.Button(row, text="Clone chip (guided) \u2026",
+                   command=self.do_clone).pack(side="left")
+        ttk.Label(row, text="reads ROM + data + status, prompts for chip "
+                            "swap, writes and verifies everything")\
+            .pack(side="left", padx=10)
+
+        f = ttk.LabelFrame(t, text="Clone dump file  (.ds2502 = data + status "
+                                   "+ ROM in one file)")
+        f.pack(fill="x", padx=6, pady=8)
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=6, pady=6)
+        ttk.Button(row, text="Read chip \u2192 Save clone dump \u2026",
+                   command=self.do_clone_save).pack(side="left")
+        ttk.Button(row, text="Load clone dump \u2192 Write to chip \u2026",
+                   command=self.do_clone_load).pack(side="left", padx=8)
+        row2 = ttk.Frame(f)
+        row2.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Label(row2, text="Save: archive the original once, clone as many "
+                             "chips as you like later \u2014 without the "
+                             "original present.").pack(side="left")
+
+        s = ttk.LabelFrame(t, text="Current clone source in memory")
+        s.pack(fill="x", padx=6, pady=8)
+        self.lbl_clone_src = ttk.Label(
+            s, text="(none - read a chip or load a dump)",
+            font=("Consolas", 10))
+        self.lbl_clone_src.pack(anchor="w", padx=8, pady=6)
+
+        ttk.Label(t, foreground="#a00000",
+                  text="\u26a0  The 64-bit ROM ID is factory-lasered and can "
+                       "never be cloned \u2014 only data + status are copied.")\
+            .pack(anchor="w", padx=10, pady=4)
+
+    def _set_clone_src(self, src, origin):
+        """Remember the clone source and show it in every view."""
+        self.clone_src = src
+        used = sum(1 for b in src["data"] if b != 0xFF)
+        stat_hex = " ".join(f"{b:02X}" for b in src["stat"])
+        self.lbl_clone_src.config(
+            text=f"{origin}\nROM    : {src.get('rom') or 'unknown'}\n"
+                 f"Data   : 128 bytes ({used} bytes != FF)\n"
+                 f"Status : {stat_hex}")
+        # update the Data memory and Status register tabs too
+        self._show_dump(src["data"])
+        self._show_status(src["stat"])
+
     # --------------------------------------------------------------- logging
     def log(self, msg):
         def _do():
@@ -365,6 +421,22 @@ class App(tk.Tk):
         return True
 
     # ------------------------------------------------------------- cloning
+    def _read_chip_full(self):
+        """Read ROM + full data + status of the connected chip."""
+        ok, p, _ = self.bridge.command("ROM")
+        if not ok:
+            raise RuntimeError(f"read ROM: {p}")
+        rom = p.split()[1]
+        ok, p, _ = self.bridge.command("RDATA 00 80")
+        if not ok:
+            raise RuntimeError(f"read data: {p}")
+        data = bytes.fromhex(p.split()[1])
+        ok, p, _ = self.bridge.command("RSTAT")
+        if not ok:
+            raise RuntimeError(f"read status: {p}")
+        stat = bytes.fromhex(p.split()[1])
+        return rom, data, stat
+
     def do_clone(self):
         """Guided 1:1 clone: original chip -> blank chip (data + status)."""
         if not self._need_conn():
@@ -372,26 +444,105 @@ class App(tk.Tk):
 
         def job():
             self.log("=== CLONE step 1/3: reading ORIGINAL chip ===")
-            ok, p, _ = self.bridge.command("ROM")
-            if not ok:
-                raise RuntimeError(f"read ROM: {p}")
-            rom = p.split()[1]
-            ok, p, _ = self.bridge.command("RDATA 00 80")
-            if not ok:
-                raise RuntimeError(f"read data: {p}")
-            data = bytes.fromhex(p.split()[1])
-            ok, p, _ = self.bridge.command("RSTAT")
-            if not ok:
-                raise RuntimeError(f"read status: {p}")
-            stat = bytes.fromhex(p.split()[1])
-
-            used = sum(1 for b in data if b != 0xFF)
-            self.clone_src = {"rom": rom, "data": data, "stat": stat}
+            rom, data, stat = self._read_chip_full()
+            src = {"rom": rom, "data": data, "stat": stat}
             self.log(f"Original ROM   : {rom}")
-            self.log(f"Original data  : 128 bytes read ({used} bytes != FF)")
+            self.log(f"Original data  : 128 bytes read "
+                     f"({sum(1 for b in data if b != 0xFF)} bytes != FF)")
             self.log("Original status: " + " ".join(f"{b:02X}" for b in stat))
-            self.after(0, self._clone_swap_prompt)
+            self.after(0, lambda: (
+                self._set_clone_src(src, "source: chip read (guided clone)"),
+                self._clone_swap_prompt()))
         self._run(job)
+
+    def do_clone_save(self):
+        """Read the connected chip and archive it as a .ds2502 clone dump."""
+        if not self._need_conn():
+            return
+
+        def job():
+            self.log("Reading chip for clone dump ...")
+            rom, data, stat = self._read_chip_full()
+            src = {"rom": rom, "data": data, "stat": stat}
+            self.log(f"Read OK - ROM {rom}, 128 B data, status "
+                     + " ".join(f"{b:02X}" for b in stat))
+            self.after(0, lambda: (
+                self._set_clone_src(src, "source: chip read (saved to dump)"),
+                self._clone_save_dialog()))
+        self._run(job)
+
+    def _clone_save_dialog(self):
+        src = self.clone_src
+        path = filedialog.asksaveasfilename(
+            defaultextension=".ds2502",
+            filetypes=[("DS2502 clone dump", "*.ds2502"),
+                       ("JSON", "*.json"), ("All files", "*.*")],
+            initialfile=f"ds2502_{src['rom'][:16]}.ds2502")
+        if not path:
+            self.log("Clone dump save cancelled.")
+            return
+        with open(path, "w") as f:
+            json.dump({
+                "tool": "DS2502_Tool clone dump",
+                "version": 1,
+                "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "rom": src["rom"],
+                "data": src["data"].hex().upper(),
+                "status": src["stat"].hex().upper(),
+            }, f, indent=2)
+        self.log(f"Clone dump saved to {path}")
+        messagebox.showinfo("Clone dump saved",
+                            f"Saved:\n{path}\n\nROM {src['rom']}\n"
+                            "128 B data + 8 B status archived.\nYou can now "
+                            "clone chips from this file any time - without "
+                            "the original.")
+
+    def do_clone_load(self):
+        """Load a .ds2502 clone dump (or raw 128-byte .bin) and write it."""
+        if not self._need_conn():
+            return
+        path = filedialog.askopenfilename(
+            filetypes=[("DS2502 clone dump", "*.ds2502"),
+                       ("JSON", "*.json"), ("Raw 128-byte bin", "*.bin"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            raw = open(path, "rb").read()
+            try:                                   # .ds2502 / .json
+                j = json.loads(raw.decode("utf-8"))
+                data = bytes.fromhex(j["data"])
+                stat = bytes.fromhex(j.get("status", "FF" * 7 + "00"))
+                rom = j.get("rom", "")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                if len(raw) == 128:                # plain data-only .bin
+                    data, stat, rom = raw, bytes([0xFF] * 7 + [0x00]), ""
+                else:
+                    raise ValueError(f"not a clone dump and not a 128-byte "
+                                     f"bin (size {len(raw)})")
+            if len(data) != 128 or len(stat) != 8:
+                raise ValueError(f"bad lengths: data {len(data)} B "
+                                 f"(need 128), status {len(stat)} B (need 8)")
+        except Exception as e:
+            messagebox.showerror("Bad clone dump", f"{path}\n\n{e}")
+            return
+
+        src = {"rom": rom, "data": data, "stat": stat}
+        self._set_clone_src(src, f"source: file  {path}")
+        self.log(f"Clone dump loaded: {path}")
+        used = sum(1 for b in data if b != 0xFF)
+        stat_hex = " ".join(f"{b:02X}" for b in stat)
+        if not messagebox.askokcancel(
+                "Write clone dump to chip",
+                f"Loaded clone dump:\n\n  ROM of source: {rom or 'unknown'}\n"
+                f"  Data  : 128 bytes ({used} != FF)\n"
+                f"  Status: {stat_hex}\n\n"
+                "Make sure the NEW (blank) chip is connected, then click OK "
+                "to burn it.\n\nWriting is PERMANENT (EPROM, bits only go "
+                "1\u21920).", icon="warning"):
+            self.log("Clone dump write cancelled.")
+            return
+        self._run(lambda: self._clone_write_from(src))
 
     def _clone_swap_prompt(self):
         src = self.clone_src
@@ -411,12 +562,11 @@ class App(tk.Tk):
         )
         if messagebox.askokcancel("Clone - swap chips now", msg,
                                   icon="warning"):
-            self._run(self._clone_write_job)
+            self._run(lambda: self._clone_write_from(src))
         else:
             self.log("Clone cancelled by user.")
 
-    def _clone_write_job(self):
-        src = self.clone_src
+    def _clone_write_from(self, src):
         s_data, s_stat = src["data"], src["stat"]
 
         self.log("=== CLONE step 2/3: checking TARGET chip ===")
@@ -424,9 +574,10 @@ class App(tk.Tk):
         if not ok:
             raise RuntimeError(f"target ROM: {p} - is the new chip inserted?")
         rom_t = p.split()[1]
-        if rom_t == src["rom"]:
-            raise RuntimeError("Same ROM ID as the original - the ORIGINAL "
-                               "chip is still connected! Swap the chips.")
+        if src.get("rom") and rom_t == src["rom"]:
+            raise RuntimeError("Same ROM ID as the clone source - the "
+                               "ORIGINAL chip is still connected! Swap the "
+                               "chips.")
         self.log(f"Target ROM     : {rom_t}")
 
         ok, p, _ = self.bridge.command("RDATA 00 80")
@@ -527,16 +678,16 @@ class App(tk.Tk):
         self.log("Status verify  : bytes 00-06 identical - OK")
         self.log("=== CLONE COMPLETE ===")
 
-        self.last_dump = v_data
         self.after(0, lambda: (
+            self._show_dump(v_data),
             self._show_status(v_stat),
             messagebox.showinfo(
                 "Clone complete",
                 "Perfect clone written and verified!\n\n"
-                f"  Original ROM : {src['rom']}\n"
-                f"  Clone ROM    : {rom_t}\n"
-                f"  Data         : 128/128 bytes identical\n"
-                f"  Status       : bytes 00h-06h identical\n\n"
+                f"  Source ROM : {src.get('rom') or '(from file)'}\n"
+                f"  Clone ROM  : {rom_t}\n"
+                f"  Data       : 128/128 bytes identical\n"
+                f"  Status     : bytes 00h-06h identical\n\n"
                 "Remember: the ROM ID itself is unique per chip and can "
                 "never be copied." + note7)))
 
@@ -579,6 +730,14 @@ class App(tk.Tk):
             self.log(f"ROM ID: {rom}{note}")
         self._run(job)
 
+    def _show_dump(self, data):
+        """Update the Data memory tab's hex view + last_dump."""
+        self.last_dump = bytes(data)
+        self.dump_txt.configure(state="normal")
+        self.dump_txt.delete("1.0", "end")
+        self.dump_txt.insert("end", hexdump(data))
+        self.dump_txt.configure(state="disabled")
+
     def do_read_data(self):
         if not self._need_conn():
             return
@@ -589,14 +748,7 @@ class App(tk.Tk):
             if not ok:
                 raise RuntimeError(payload)
             data = bytes.fromhex(payload.split()[1])
-            self.last_dump = data
-
-            def show():
-                self.dump_txt.configure(state="normal")
-                self.dump_txt.delete("1.0", "end")
-                self.dump_txt.insert("end", hexdump(data))
-                self.dump_txt.configure(state="disabled")
-            self.after(0, show)
+            self.after(0, lambda: self._show_dump(data))
             self.log(f"Read {len(data)} bytes OK (CRC verified by bridge).")
         self._run(job)
 
