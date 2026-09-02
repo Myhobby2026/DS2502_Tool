@@ -166,6 +166,8 @@ class App(tk.Tk):
             .pack(side="left", padx=12)
         ttk.Button(bar, text="Diagnose bus", command=self.do_diag)\
             .pack(side="left", padx=2)
+        ttk.Button(bar, text="Clone chip \u2026", command=self.do_clone)\
+            .pack(side="left", padx=2)
         self.lbl_rom = ttk.Label(bar, text="ROM: --", font=("Consolas", 10))
         self.lbl_rom.pack(side="left", padx=4)
 
@@ -361,6 +363,182 @@ class App(tk.Tk):
             messagebox.showwarning("Not connected", "Connect to the bridge first.")
             return False
         return True
+
+    # ------------------------------------------------------------- cloning
+    def do_clone(self):
+        """Guided 1:1 clone: original chip -> blank chip (data + status)."""
+        if not self._need_conn():
+            return
+
+        def job():
+            self.log("=== CLONE step 1/3: reading ORIGINAL chip ===")
+            ok, p, _ = self.bridge.command("ROM")
+            if not ok:
+                raise RuntimeError(f"read ROM: {p}")
+            rom = p.split()[1]
+            ok, p, _ = self.bridge.command("RDATA 00 80")
+            if not ok:
+                raise RuntimeError(f"read data: {p}")
+            data = bytes.fromhex(p.split()[1])
+            ok, p, _ = self.bridge.command("RSTAT")
+            if not ok:
+                raise RuntimeError(f"read status: {p}")
+            stat = bytes.fromhex(p.split()[1])
+
+            used = sum(1 for b in data if b != 0xFF)
+            self.clone_src = {"rom": rom, "data": data, "stat": stat}
+            self.log(f"Original ROM   : {rom}")
+            self.log(f"Original data  : 128 bytes read ({used} bytes != FF)")
+            self.log("Original status: " + " ".join(f"{b:02X}" for b in stat))
+            self.after(0, self._clone_swap_prompt)
+        self._run(job)
+
+    def _clone_swap_prompt(self):
+        src = self.clone_src
+        stat_hex = " ".join(f"{b:02X}" for b in src["stat"])
+        msg = (
+            "ORIGINAL chip read successfully:\n\n"
+            f"  ROM ID : {src['rom']}\n"
+            f"  Data   : 128 bytes\n"
+            f"  Status : {stat_hex}\n\n"
+            "Now:\n"
+            "  1. REMOVE the original chip from the socket\n"
+            "  2. INSERT the new (blank) chip\n"
+            "  3. Click OK to burn the clone\n\n"
+            "Writing is PERMANENT (EPROM, bits only go 1\u21920).\n"
+            "Note: the 64-bit ROM ID is factory-lasered and CANNOT be "
+            "cloned - only data + status are copied."
+        )
+        if messagebox.askokcancel("Clone - swap chips now", msg,
+                                  icon="warning"):
+            self._run(self._clone_write_job)
+        else:
+            self.log("Clone cancelled by user.")
+
+    def _clone_write_job(self):
+        src = self.clone_src
+        s_data, s_stat = src["data"], src["stat"]
+
+        self.log("=== CLONE step 2/3: checking TARGET chip ===")
+        ok, p, _ = self.bridge.command("ROM")
+        if not ok:
+            raise RuntimeError(f"target ROM: {p} - is the new chip inserted?")
+        rom_t = p.split()[1]
+        if rom_t == src["rom"]:
+            raise RuntimeError("Same ROM ID as the original - the ORIGINAL "
+                               "chip is still connected! Swap the chips.")
+        self.log(f"Target ROM     : {rom_t}")
+
+        ok, p, _ = self.bridge.command("RDATA 00 80")
+        if not ok:
+            raise RuntimeError(f"target data read: {p}")
+        t_data = bytes.fromhex(p.split()[1])
+        ok, p, _ = self.bridge.command("RSTAT")
+        if not ok:
+            raise RuntimeError(f"target status read: {p}")
+        t_stat = bytes.fromhex(p.split()[1])
+
+        # EPROM compatibility: target must not have 0-bits where source has 1
+        bad = [i for i in range(128)
+               if (t_data[i] & s_data[i]) != s_data[i]]
+        bad_s = [a for a in range(7)
+                 if (t_stat[a] & s_stat[a]) != s_stat[a]]
+        if bad or bad_s:
+            where = ", ".join(f"data 0x{i:02X}" for i in bad[:8])
+            if bad_s:
+                where += (", " if where else "") + \
+                         ", ".join(f"status 0x{a:02X}" for a in bad_s)
+            raise RuntimeError(
+                f"Target is NOT blank enough - it already has 0-bits where "
+                f"the original has 1-bits at: {where}"
+                f"{' ...' if len(bad) > 8 else ''}. A perfect clone is "
+                f"impossible on this chip; use a fresh one.")
+        if all(b == 0xFF for b in t_data):
+            self.log("Target data    : blank (all FF) - good")
+        else:
+            self.log("Target data    : partially programmed but compatible")
+
+        self.log("=== CLONE step 3/3: writing DATA, then STATUS ===")
+
+        # ---- data: write only contiguous runs that differ, 32 B chunks ----
+        runs, i = [], 0
+        while i < 128:
+            if t_data[i] != s_data[i]:
+                j = i
+                while j < 128 and t_data[j] != s_data[j]:
+                    j += 1
+                runs.append((i, j))
+                i = j
+            else:
+                i += 1
+        total = sum(b - a for a, b in runs)
+        self.log(f"Data bytes to program: {total} in {len(runs)} block(s)")
+        for a, b in runs:
+            for c in range(a, b, 32):
+                d = min(c + 32, b)
+                chunk = s_data[c:d]
+                ok, p, _ = self.bridge.command(
+                    f"WDATA {c:02X} {chunk.hex().upper()}",
+                    timeout=10 + len(chunk),
+                    progress=lambda ln: self.log("  " + ln))
+                if not ok:
+                    raise RuntimeError(f"data write failed: {p}")
+
+        # ---- verify data ----
+        ok, p, _ = self.bridge.command("RDATA 00 80")
+        if not ok:
+            raise RuntimeError(f"data verify read: {p}")
+        v_data = bytes.fromhex(p.split()[1])
+        diff = [i for i in range(128) if v_data[i] != s_data[i]]
+        if diff:
+            raise RuntimeError(
+                "DATA VERIFY FAILED at " +
+                ", ".join(f"0x{i:02X}" for i in diff[:8]) +
+                (" ..." if len(diff) > 8 else ""))
+        self.log("Data verify    : 128/128 bytes identical - OK")
+
+        # ---- status: redirection/reserved bytes 1..6 first, WP byte 0 LAST
+        #      (locking pages first would make the data unwritable!) ----
+        wrote = 0
+        for a in (1, 2, 3, 4, 5, 6, 0):
+            if s_stat[a] != 0xFF and t_stat[a] != s_stat[a]:
+                ok, p, _ = self.bridge.command(
+                    f"WSTAT {a:02X} {s_stat[a]:02X}", timeout=15,
+                    progress=lambda ln: self.log("  " + ln))
+                if not ok:
+                    raise RuntimeError(f"status write @{a:02X}: {p}")
+                wrote += 1
+        self.log(f"Status bytes programmed: {wrote}")
+
+        # ---- verify status ----
+        ok, p, _ = self.bridge.command("RSTAT")
+        if not ok:
+            raise RuntimeError(f"status verify read: {p}")
+        v_stat = bytes.fromhex(p.split()[1])
+        sdiff = [a for a in range(7) if v_stat[a] != s_stat[a]]
+        if sdiff:
+            raise RuntimeError("STATUS VERIFY FAILED at byte(s) " +
+                               ", ".join(f"0x{a:02X}" for a in sdiff))
+        note7 = ""
+        if v_stat[7] != s_stat[7]:
+            note7 = (f"\n\nNote: factory byte 07h differs "
+                     f"(original {s_stat[7]:02X}, clone {v_stat[7]:02X}) - "
+                     f"it is factory-programmed and cannot be changed.")
+        self.log("Status verify  : bytes 00-06 identical - OK")
+        self.log("=== CLONE COMPLETE ===")
+
+        self.last_dump = v_data
+        self.after(0, lambda: (
+            self._show_status(v_stat),
+            messagebox.showinfo(
+                "Clone complete",
+                "Perfect clone written and verified!\n\n"
+                f"  Original ROM : {src['rom']}\n"
+                f"  Clone ROM    : {rom_t}\n"
+                f"  Data         : 128/128 bytes identical\n"
+                f"  Status       : bytes 00h-06h identical\n\n"
+                "Remember: the ROM ID itself is unique per chip and can "
+                "never be copied." + note7)))
 
     # ------------------------------------------------------------- ROM / read
     def do_diag(self):

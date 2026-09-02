@@ -28,6 +28,23 @@ identification.
 > be erased.** All writes are permanent. The GUI asks for confirmation before
 > every write.
 
+## Cloning a chip 1:1
+
+Use the **Clone chip …** button. Guided flow:
+
+1. Reads the ORIGINAL chip completely (ROM + 128 B data + 8 B status)
+2. Prompts you to swap in the new (blank) chip
+3. Safety checks: refuses if the original is still connected (same ROM ID)
+   or if the target already has 0-bits where the original has 1-bits
+4. Writes the data memory, verifies all 128 bytes
+5. Writes the status register — redirection bytes **first**, the
+   write-protect byte `00h` **last** (locking pages first would make the
+   data unwritable!) — then verifies bytes `00h`–`06h`
+
+> The 64-bit **ROM ID cannot be cloned** — it is factory-lasered and unique
+> per chip. Data + status are copied bit-perfect; if the host system
+> cross-checks the ROM ID itself, no EPROM clone can pass that check.
+
 ## Status register map (DS2502 datasheet)
 
 | Addr | Meaning |
