@@ -94,6 +94,8 @@ Notes:
 
 ```
 PING                     -> OK PONG DS2502-BRIDGE v1.0
+DIAG                     -> bus health report, then OK DIAG IDLE=1 RELEASE=1 PRESENCE=3
+SEARCH                   -> DEV <rom> lines, then OK SEARCH <count>
 ROM                      -> OK ROM 09A1B2C3D4E5F607
 RDATA <addr> <len>       -> OK DATA 55AA...        (hex, addr/len in hex)
 RSTAT                    -> OK STAT FFFFFFFFFFFFFF00
@@ -103,6 +105,29 @@ WSTAT <addr> <hexbytes>  -> BYTE 0000 W=FE R=FE OK ... OK WSTAT <n>
 
 Errors answer `ERR <reason>` (`NO_DEVICE`, `CMD_CRC`, `WRITE_CRC at ...`,
 `VERIFY at ...`, `RANGE`, ...). A write aborts on the first failed byte.
+
+## Troubleshooting: `NO_DEVICE (no presence pulse)`
+
+The serial link is fine (`PING` works) but nothing answered the 1-Wire reset.
+Use the **Diagnose bus** button in the GUI (or send `DIAG` / `SEARCH` from a
+serial terminal) and check, in order of likelihood:
+
+1. **Wrong pin.** `OW_PIN 4` means **GPIO4**. On a NodeMCU/ESP8266 that is the
+   pin silk-screened **D2** — *not* D4 (D4 is GPIO2!). On an ESP32 DevKit the
+   pin is labeled `4` / `G4` / `P4`.
+2. **Missing pull-up.** Without the 4.7 kΩ from DQ to **3V3** the line can't
+   idle high and no presence pulse is possible. A multimeter on DQ should
+   read ≈ 3.3 V when idle (`DIAG` reports this as *DQ idle level*).
+3. **DS2502 pinout / orientation.** TO-92 with the **flat face toward you,
+   legs down: 1 = GND (left), 2 = DQ (middle), 3 = NC (right)**. GND and DQ
+   swapped = permanent "no presence".
+4. **12 V switch leaking or inverted.** DQ must sit at ~3.3 V idle — if you
+   measure ~12 V, Q2 is on: check `PROG_ACTIVE_HIGH` matches your circuit and
+   that R4 (gate pull-up to +12 V) is fitted. A DS2502 held at 12 V for a long
+   time may be damaged.
+5. **Isolate.** Temporarily disconnect the 12 V pulse circuit and wire just
+   DS2502 + pull-up to the ESP. If presence appears, the fault is in the
+   pulse switch; reads work fine without the 12 V section connected.
 
 ## GUI — run
 

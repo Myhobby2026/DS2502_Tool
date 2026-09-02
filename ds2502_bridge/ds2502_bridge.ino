@@ -286,6 +286,64 @@ static void handleLine(char *line)
     return;
   }
 
+  /* ---- DIAG : 1-Wire bus health check ---- */
+  if (!strcmp(cmd, "DIAG")) {
+    /* 1. idle level of DQ (must be HIGH through the 4.7k pull-up) */
+    pinMode(OW_PIN, INPUT);
+    delayMicroseconds(100);
+    int idle = digitalRead(OW_PIN);
+    Serial.print(F("DQ idle level: "));
+    Serial.println(idle
+      ? F("HIGH - good (pull-up working)")
+      : F("LOW  - BAD! short to GND, missing 4.7k pull-up, or DS2502 GND/DQ swapped"));
+
+    /* 2. can we pull the line low and does it come back up? */
+    pinMode(OW_PIN, OUTPUT);
+    digitalWrite(OW_PIN, LOW);
+    delayMicroseconds(60);
+    pinMode(OW_PIN, INPUT);
+    delayMicroseconds(100);
+    int rel = digitalRead(OW_PIN);
+    Serial.print(F("DQ release test: "));
+    Serial.println(rel
+      ? F("returns HIGH - good")
+      : F("stays LOW - BAD! line stuck (short or wrong pin)"));
+
+    /* 3. presence pulse, tried 3x */
+    uint8_t hits = 0;
+    for (uint8_t i = 0; i < 3; i++) { if (ow.reset()) hits++; delay(2); }
+    Serial.print(F("Presence pulse: "));
+    Serial.print(hits); Serial.println(F("/3 resets answered"));
+    if (!hits) {
+      Serial.println(F("-> no device: check DS2502 pinout (TO-92 flat face"));
+      Serial.println(F("   toward you, legs down: 1=GND 2=DQ 3=NC), the"));
+      Serial.println(F("   pull-up, and that OW_PIN matches your wiring"));
+      Serial.println(F("   (OW_PIN 4 = GPIO4 = NodeMCU 'D2', NOT 'D4'!)"));
+    }
+
+    Serial.print(F("OK DIAG IDLE=")); Serial.print(idle);
+    Serial.print(F(" RELEASE="));     Serial.print(rel);
+    Serial.print(F(" PRESENCE="));    Serial.println(hits);
+    return;
+  }
+
+  /* ---- SEARCH : enumerate every device on the bus ---- */
+  if (!strcmp(cmd, "SEARCH")) {
+    uint8_t rom[8];
+    uint8_t n = 0;
+    ow.reset_search();
+    while (ow.search(rom)) {
+      Serial.print(F("DEV "));
+      printHexBuf(rom, 8);
+      Serial.print(OneWire::crc8(rom, 7) == rom[7] ? F(" CRC=OK") : F(" CRC=BAD"));
+      if (rom[0] == DS2502_FAMILY) Serial.print(F(" (DS2502)"));
+      Serial.println();
+      n++;
+    }
+    Serial.print(F("OK SEARCH ")); Serial.println(n);
+    return;
+  }
+
   /* ---- ROM ---- */
   if (!strcmp(cmd, "ROM")) {
     uint8_t rom[8];
@@ -359,7 +417,7 @@ void setup()
   progPinIdle();                 // make absolutely sure 12V is OFF
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("# DS2502 bridge ready (PING/ROM/RDATA/RSTAT/WDATA/WSTAT)"));
+  Serial.println(F("# DS2502 bridge ready (PING/DIAG/SEARCH/ROM/RDATA/RSTAT/WDATA/WSTAT)"));
 }
 
 void loop()

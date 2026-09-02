@@ -164,6 +164,8 @@ class App(tk.Tk):
 
         ttk.Button(bar, text="Read ROM ID", command=self.do_read_rom)\
             .pack(side="left", padx=12)
+        ttk.Button(bar, text="Diagnose bus", command=self.do_diag)\
+            .pack(side="left", padx=2)
         self.lbl_rom = ttk.Label(bar, text="ROM: --", font=("Consolas", 10))
         self.lbl_rom.pack(side="left", padx=4)
 
@@ -361,6 +363,29 @@ class App(tk.Tk):
         return True
 
     # ------------------------------------------------------------- ROM / read
+    def do_diag(self):
+        if not self._need_conn():
+            return
+
+        def job():
+            self.log("Running 1-Wire bus diagnostics ...")
+            ok, payload, lines = self.bridge.command("DIAG", timeout=10)
+            for ln in lines:
+                self.log("  " + ln)
+            if not ok:
+                raise RuntimeError(payload)
+            self.log(f"DIAG result: {payload}")
+            report = "\n".join(lines) or payload
+            self.after(0, lambda r=report: messagebox.showinfo(
+                "1-Wire bus diagnostics", r))
+            # also list every device found on the bus
+            ok, payload, lines = self.bridge.command("SEARCH", timeout=10)
+            for ln in lines:
+                self.log("  " + ln)
+            if ok:
+                self.log(f"Devices on bus: {payload.split()[-1]}")
+        self._run(job)
+
     def do_read_rom(self):
         if not self._need_conn():
             return
