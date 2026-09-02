@@ -27,6 +27,8 @@
 """
 
 import json
+import os
+import sys
 import threading
 import time
 import tkinter as tk
@@ -327,6 +329,18 @@ class App(tk.Tk):
                              "chips as you like later \u2014 without the "
                              "original present.").pack(side="left")
 
+        e = ttk.LabelFrame(t, text="Emulator (when the host checks the ROM ID "
+                                   "\u2014 e.g. printer says 'not compatible')")
+        e.pack(fill="x", padx=6, pady=8)
+        row = ttk.Frame(e)
+        row.pack(fill="x", padx=6, pady=6)
+        ttk.Button(row, text="Dump \u2192 Emulator sketch \u2026",
+                   command=self.do_emulator_sketch).pack(side="left")
+        ttk.Label(row, text="generates an Arduino sketch (ESP32 / ATtiny85, "
+                            "OneWireHub lib) that impersonates the original "
+                            "chip INCLUDING its ROM ID")\
+            .pack(side="left", padx=10)
+
         s = ttk.LabelFrame(t, text="Current clone source in memory")
         s.pack(fill="x", padx=6, pady=8)
         self.lbl_clone_src = ttk.Label(
@@ -543,6 +557,44 @@ class App(tk.Tk):
             self.log("Clone dump write cancelled.")
             return
         self._run(lambda: self._clone_write_from(src))
+
+    def do_emulator_sketch(self):
+        """Generate a DS2502 emulator Arduino sketch from a clone dump."""
+        path = filedialog.askopenfilename(
+            title="Select the clone dump of the ORIGINAL chip",
+            filetypes=[("DS2502 clone dump", "*.ds2502"),
+                       ("JSON", "*.json"), ("Raw 128-byte bin", "*.bin"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        out_dir = filedialog.askdirectory(
+            title="Where should the sketch folder be created?")
+        if not out_dir:
+            return
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from make_emulator import generate_sketch
+            ino, rom, warns = generate_sketch(path, out_dir)
+        except Exception as e:
+            messagebox.showerror("Emulator sketch failed", str(e))
+            return
+        self.log(f"Emulator sketch generated: {ino}")
+        self.log(f"Emulated ROM ID: {rom.hex().upper()}")
+        for w in warns:
+            self.log(f"WARNING: {w}")
+        messagebox.showinfo(
+            "Emulator sketch generated",
+            f"Sketch written:\n{ino}\n\n"
+            f"Emulated ROM ID: {rom.hex().upper()}\n\n"
+            "Flash it:\n"
+            "  1. Arduino IDE \u2192 Library Manager \u2192 install "
+            "'OneWireHub'\n"
+            "  2. Open the sketch, select ESP32 or ATtiny85 board\n"
+            "  3. Upload, then wire host DATA \u2192 emulator pin, "
+            "GND \u2192 GND\n\n"
+            "The emulator presents the ORIGINAL ROM ID + data + status "
+            "\u2014 this passes hosts that reject real-chip clones."
+            + ("".join("\n\nWARNING: " + w for w in warns)))
 
     def _clone_swap_prompt(self):
         src = self.clone_src

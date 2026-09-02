@@ -56,6 +56,28 @@ Safety built in:
 > per chip. Data + status are copied bit-perfect; if the host system
 > cross-checks the ROM ID itself, no EPROM clone can pass that check.
 
+## Host rejects the clone? ("cartridge not compatible")
+
+If the original chip works but the verified clone is rejected, the host
+(printer etc.) is validating the **ROM ID** — either directly, or through a
+signature inside the 128-byte data that is derived from the ROM ID. No real
+DS2502 can ever pass that, because the ROM ID is factory-lasered.
+
+The solution is an **emulator**: a microcontroller that behaves like a
+DS2502 on the 1-Wire bus and presents the ORIGINAL ROM ID + data + status.
+
+* GUI: *Cloning* tab → **Dump → Emulator sketch …**
+* CLI: `python3 make_emulator.py mydump.ds2502 [output_dir]`
+
+This generates an Arduino sketch (based on the
+[OneWireHub](https://github.com/orgua/OneWireHub) library, install it via
+the Arduino IDE Library Manager) that runs on an **ESP32** (data pin GPIO4)
+or an **ATtiny85** (data pin PB2, physical pin 7, clock ≥ 8 MHz). Wiring:
+host DATA contact → emulator pin, host GND → MCU GND (common ground is
+essential). The emulator needs its own power supply — it cannot run from
+1-Wire parasite power like the real chip — and should run at the same logic
+voltage as the host bus.
+
 ## Status register map (DS2502 datasheet)
 
 | Addr | Meaning |
