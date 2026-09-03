@@ -16,6 +16,19 @@ import json
 import sys
 
 
+def crc8(buf, seed=0):
+    """Dallas/Maxim CRC8 (poly 0x8C reflected, LSB first)."""
+    for b in buf:
+        d = b
+        for _ in range(8):
+            mix = (seed ^ d) & 1
+            seed >>= 1
+            if mix:
+                seed ^= 0x8C
+            d >>= 1
+    return seed
+
+
 def load(path):
     raw = open(path, "rb").read()
     try:
@@ -26,7 +39,14 @@ def load(path):
     except (UnicodeDecodeError, json.JSONDecodeError):
         if len(raw) == 128:
             return b"", raw, bytes([0xFF] * 7 + [0x00])
-        raise
+        if len(raw) == 136:
+            head, tail = raw[:8], raw[128:]
+            if crc8(tail[:7]) == tail[7] and tail[0] != 0xFF:
+                return tail, raw[:128], bytes([0xFF] * 7 + [0x00])
+            if crc8(head[:7]) == head[7] and head[0] != 0xFF:
+                return head, raw[8:], bytes([0xFF] * 7 + [0x00])
+            return b"", raw[:128], raw[128:]
+        raise ValueError(f"{path}: unsupported size {len(raw)}")
 
 
 def main(paths):
@@ -60,6 +80,15 @@ def main(paths):
             row = " |  ".join(f"{d[2][off]:02X}" for d in dumps)
             print(f"   {off:02X}h  |  {row}")
 
+    # ---- per-page CRC scheme (last byte of each 32 B page = CRC8) ----
+    print()
+    for p, rom, data, stat in dumps:
+        oks = [crc8(data[a:a + 31]) == data[a + 31]
+               for a in range(0, 128, 32)]
+        print(f"{p}: page CRCs "
+              + " ".join(f"pg{i}:{'OK' if ok else 'no'}"
+                         for i, ok in enumerate(oks)))
+
     # ---- does the chip's own ROM ID appear inside its data? ----
     print()
     for p, rom, data, stat in dumps:
@@ -76,9 +105,10 @@ def main(paths):
                                 f"{idx:02X}h")
             if hits:
                 break
-        rev = data.find(rom[:6][::-1])
+        rev = data.find(rom[1:7][::-1])
         if rev >= 0:
-            hits.append(f"reversed ROM serial at offset {rev:02X}h")
+            hits.append(f"reversed ROM serial (bytes 1..6 of ROM) "
+                        f"at offset {rev:02X}h")
         tag = "; ".join(hits) if hits else "no direct ROM-ID bytes found"
         print(f"{p}: {tag}")
 

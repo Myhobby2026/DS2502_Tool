@@ -133,6 +133,173 @@ def hexdump(data, base=0):
     return "\n".join(out)
 
 
+def parse_hexdump(text):
+    """Parse an edited hex dump back into bytes.
+
+    Accepts the format produced by hexdump() ('0010:  AA BB ..  |ascii|')
+    as well as plain hex bytes.  The ASCII column after '|' and the
+    'NNNN:' offset prefix are ignored."""
+    data = bytearray()
+    for line in text.splitlines():
+        line = line.split("|")[0]          # drop ASCII column
+        if ":" in line:
+            line = line.split(":", 1)[1]   # drop offset prefix
+        for tok in line.replace(",", " ").split():
+            if len(tok) != 2:
+                raise ValueError(f"bad hex byte '{tok}'")
+            data.append(int(tok, 16))
+    return bytes(data)
+
+
+def crc8_dallas(buf, seed=0):
+    """Dallas/Maxim CRC8 (poly 0x8C reflected, LSB first)."""
+    for b in buf:
+        d = b
+        for _ in range(8):
+            mix = (seed ^ d) & 1
+            seed >>= 1
+            if mix:
+                seed ^= 0x8C
+            d >>= 1
+    return seed
+
+
+def load_dump_file(path):
+    """Load a dump file WITHOUT writing anything.
+
+    Supported formats:
+      * .ds2502 / .json  - ROM + data + status (this tool's archive format)
+      * raw 128-byte .bin - data only
+      * raw 136-byte .bin - 128 B data + 8 B ROM ID trailer (reader tools),
+                            or 8 B ROM header + 128 B data,
+                            or 128 B data + 8 B status (fallback)
+    Returns (rom_hex, data128, stat8, format_description)."""
+    raw = open(path, "rb").read()
+    try:
+        j = json.loads(raw.decode("utf-8"))
+        data = bytes.fromhex(j["data"])
+        stat = bytes.fromhex(j.get("status", "FF" * 7 + "00"))
+        rom = (j.get("rom") or "").upper()
+        if len(data) != 128 or len(stat) != 8:
+            raise ValueError(f"bad lengths in JSON dump: data {len(data)} B "
+                             f"(need 128), status {len(stat)} B (need 8)")
+        return rom, data, stat, ".ds2502 JSON dump (ROM + data + status)"
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pass
+    if len(raw) == 128:
+        return "", raw, bytes([0xFF] * 7 + [0x00]), \
+               "raw 128-byte .bin (data only, no ROM/status)"
+    if len(raw) == 136:
+        head, tail = raw[:8], raw[128:]
+        if crc8_dallas(tail[:7]) == tail[7] and tail[0] != 0xFF:
+            return tail.hex().upper(), raw[:128], \
+                   bytes([0xFF] * 7 + [0x00]), \
+                   "raw 136-byte .bin: 128 B data + 8 B ROM ID trailer"
+        if crc8_dallas(head[:7]) == head[7] and head[0] != 0xFF:
+            return head.hex().upper(), raw[8:], \
+                   bytes([0xFF] * 7 + [0x00]), \
+                   "raw 136-byte .bin: 8 B ROM ID header + 128 B data"
+        return "", raw[:128], raw[128:], \
+               "raw 136-byte .bin: 128 B data + 8 B status (no ROM CRC found)"
+    raise ValueError(f"unsupported dump: {len(raw)} bytes "
+                     "(expected .ds2502 JSON, 128-byte or 136-byte .bin)")
+
+
+def analyze_dump(rom_hex, data, stat):
+    """Offline consistency check of a dump. Returns list of report lines."""
+    lines = []
+    rom = bytes.fromhex(rom_hex) if rom_hex else b""
+    if rom:
+        ok = crc8_dallas(rom[:7]) == rom[7]
+        fam = rom[0]
+        lines.append(f"ROM ID   : {rom_hex}  CRC8 {'OK' if ok else 'BAD!'}"
+                     f", family {fam:02X}h"
+                     + ("" if fam == 0x09 else "  (NOT DS2502 family 09h!)"))
+    else:
+        lines.append("ROM ID   : (none in file)")
+    used = sum(1 for b in data if b != 0xFF)
+    lines.append(f"Data     : 128 bytes, {used} bytes != FF")
+
+    # per-page CRC pattern (e.g. Hamilton O2 sensor: last byte of every
+    # 32-byte page = Dallas CRC8 of the first 31 bytes)
+    crc_ok = []
+    for pg in range(4):
+        a = pg * 32
+        page = data[a:a + 32]
+        calc = crc8_dallas(page[:31])
+        good = calc == page[31]
+        crc_ok.append(good)
+        lines.append(f"page {pg}   : [{a:02X}h-{a + 31:02X}h] last byte "
+                     f"{page[31]:02X} vs CRC8(first 31) {calc:02X}  "
+                     f"-> {'CRC OK' if good else 'no page-CRC match'}")
+    if all(crc_ok):
+        lines.append("           all 4 pages follow the page-CRC scheme "
+                     "(application data format detected)")
+
+    # is the chip's own ROM ID embedded in the data (= ID binding)?
+    if rom:
+        ser = rom[1:7]
+        idx = data.find(ser[::-1])
+        if idx >= 0:
+            lines.append(f"BINDING  : reversed ROM serial "
+                         f"{ser[::-1].hex().upper()} found at data offset "
+                         f"{idx:02X}h -> data is PERSONALIZED to this ROM ID")
+        else:
+            idx = data.find(ser)
+            if idx >= 0:
+                lines.append(f"BINDING  : ROM serial found at data offset "
+                             f"{idx:02X}h -> data is PERSONALIZED to this "
+                             "ROM ID")
+            else:
+                lines.append("BINDING  : ROM serial not found verbatim in "
+                             "data (binding may still exist via checksum)")
+    stat_hex = " ".join(f"{b:02X}" for b in stat)
+    lines.append(f"Status   : {stat_hex}")
+    return lines
+
+
+def rebind_data(data, old_rom_hex, new_rom_hex):
+    """Re-personalize dump data from one ROM ID to another.
+
+    Replaces every occurrence of the old ROM serial (reversed and forward)
+    inside the 128-byte data with the new chip's serial, then fixes the
+    page CRC of every page that followed the page-CRC scheme before.
+    Returns (new_data, report_lines)."""
+    old = bytes.fromhex(old_rom_hex)
+    new = bytes.fromhex(new_rom_hex)
+    d = bytearray(data)
+    rep = []
+
+    # remember which pages had a valid CRC before we touch anything
+    valid = [crc8_dallas(bytes(d[p * 32:p * 32 + 31])) == d[p * 32 + 31]
+             for p in range(4)]
+
+    for pat, sub, tag in ((old[1:7][::-1], new[1:7][::-1], "reversed serial"),
+                          (old[1:7], new[1:7], "serial"),
+                          (old, new, "full ROM")):
+        start = 0
+        while True:
+            i = bytes(d).find(pat, start)
+            if i < 0:
+                break
+            d[i:i + len(pat)] = sub
+            rep.append(f"replaced {tag} at offset {i:02X}h: "
+                       f"{pat.hex().upper()} -> {sub.hex().upper()}")
+            start = i + len(pat)
+    if not rep:
+        rep.append("old ROM serial not found in data - nothing replaced")
+        return bytes(d), rep
+
+    for p in range(4):
+        if valid[p]:
+            calc = crc8_dallas(bytes(d[p * 32:p * 32 + 31]))
+            if d[p * 32 + 31] != calc:
+                rep.append(f"page {p} CRC fixed: {d[p * 32 + 31]:02X} -> "
+                           f"{calc:02X}")
+                d[p * 32 + 31] = calc
+    return bytes(d), rep
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -314,20 +481,36 @@ class App(tk.Tk):
                             "swap, writes and verifies everything")\
             .pack(side="left", padx=10)
 
-        f = ttk.LabelFrame(t, text="Clone dump file  (.ds2502 = data + status "
-                                   "+ ROM in one file)")
+        f = ttk.LabelFrame(t, text="Step-by-step clone from file  "
+                                   "(load \u2192 check \u2192 edit \u2192 write "
+                                   "\u2014 each step is separate)")
         f.pack(fill="x", padx=6, pady=8)
         row = ttk.Frame(f)
         row.pack(fill="x", padx=6, pady=6)
-        ttk.Button(row, text="Read chip \u2192 Save clone dump \u2026",
-                   command=self.do_clone_save).pack(side="left")
-        ttk.Button(row, text="Load clone dump \u2192 Write to chip \u2026",
-                   command=self.do_clone_load).pack(side="left", padx=8)
+        ttk.Button(row, text="1\u20e3 Load dump file \u2026",
+                   command=self.do_load_dump).pack(side="left")
+        ttk.Button(row, text="2\u20e3 Check dump (offline)",
+                   command=self.do_check_dump).pack(side="left", padx=6)
+        ttk.Button(row, text="2\u20e3 Compare with chip",
+                   command=self.do_compare_chip).pack(side="left", padx=6)
+        ttk.Button(row, text="3\u20e3 Edit hex \u2026",
+                   command=self.do_edit_hex).pack(side="left", padx=6)
+        ttk.Button(row, text="4\u20e3 WRITE to chip \u2026",
+                   command=self.do_write_loaded).pack(side="left", padx=6)
         row2 = ttk.Frame(f)
         row2.pack(fill="x", padx=6, pady=(0, 6))
-        ttk.Label(row2, text="Save: archive the original once, clone as many "
-                             "chips as you like later \u2014 without the "
-                             "original present.").pack(side="left")
+        ttk.Label(row2, text="Load NEVER writes anything. Supported files: "
+                             ".ds2502 JSON, raw 128-byte .bin, 136-byte .bin "
+                             "(data + ROM trailer).").pack(side="left")
+        row3 = ttk.Frame(f)
+        row3.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(row3, text="Read chip \u2192 Save clone dump \u2026",
+                   command=self.do_clone_save).pack(side="left")
+        ttk.Button(row3, text="Rebind data to NEW chip ROM ID \u2026",
+                   command=self.do_rebind).pack(side="left", padx=8)
+        ttk.Label(row3, text="rebind = replace embedded old serial with the "
+                             "target chip's serial + fix page CRCs")\
+            .pack(side="left", padx=4)
 
         e = ttk.LabelFrame(t, text="Emulator (when the host checks the ROM ID "
                                    "\u2014 e.g. printer says 'not compatible')")
@@ -511,52 +694,256 @@ class App(tk.Tk):
                             "clone chips from this file any time - without "
                             "the original.")
 
-    def do_clone_load(self):
-        """Load a .ds2502 clone dump (or raw 128-byte .bin) and write it."""
-        if not self._need_conn():
-            return
+    # ------------------------------------------- separate load/check/edit/write
+    def do_load_dump(self):
+        """STEP 1: load a dump file into memory. Writes NOTHING."""
         path = filedialog.askopenfilename(
-            filetypes=[("DS2502 clone dump", "*.ds2502"),
-                       ("JSON", "*.json"), ("Raw 128-byte bin", "*.bin"),
+            title="Load dump file (nothing is written to the chip)",
+            filetypes=[("All dumps", "*.ds2502 *.json *.bin"),
+                       ("DS2502 clone dump", "*.ds2502"),
+                       ("JSON", "*.json"), ("Raw bin (128/136 B)", "*.bin"),
                        ("All files", "*.*")])
         if not path:
             return
         try:
-            raw = open(path, "rb").read()
-            try:                                   # .ds2502 / .json
-                j = json.loads(raw.decode("utf-8"))
-                data = bytes.fromhex(j["data"])
-                stat = bytes.fromhex(j.get("status", "FF" * 7 + "00"))
-                rom = j.get("rom", "")
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                if len(raw) == 128:                # plain data-only .bin
-                    data, stat, rom = raw, bytes([0xFF] * 7 + [0x00]), ""
-                else:
-                    raise ValueError(f"not a clone dump and not a 128-byte "
-                                     f"bin (size {len(raw)})")
-            if len(data) != 128 or len(stat) != 8:
-                raise ValueError(f"bad lengths: data {len(data)} B "
-                                 f"(need 128), status {len(stat)} B (need 8)")
+            rom, data, stat, fmt = load_dump_file(path)
         except Exception as e:
-            messagebox.showerror("Bad clone dump", f"{path}\n\n{e}")
+            messagebox.showerror("Bad dump file", f"{path}\n\n{e}")
+            return
+        src = {"rom": rom, "data": data, "stat": stat, "path": path}
+        self._set_clone_src(src, f"source: file  {os.path.basename(path)}")
+        self.log(f"Loaded: {path}")
+        self.log(f"Format: {fmt}")
+        for ln in analyze_dump(rom, data, stat):
+            self.log("  " + ln)
+        messagebox.showinfo(
+            "Dump loaded (nothing written)",
+            f"{os.path.basename(path)}\n\nFormat: {fmt}\n"
+            f"ROM: {rom or 'unknown'}\n\n"
+            "The dump is now loaded in memory and shown in the Data memory "
+            "tab.\nNext: '2\u20e3 Check dump' or '2\u20e3 Compare with "
+            "chip', then '3\u20e3 Edit hex' if needed, then "
+            "'4\u20e3 WRITE to chip'.")
+
+    def _need_src(self):
+        src = getattr(self, "clone_src", None)
+        if not src:
+            messagebox.showinfo("No dump loaded",
+                                "Load a dump file (step 1) or read a chip "
+                                "first.")
+            return None
+        return src
+
+    def do_check_dump(self):
+        """STEP 2a: offline consistency check of the loaded dump."""
+        src = self._need_src()
+        if not src:
+            return
+        lines = analyze_dump(src.get("rom", ""), src["data"], src["stat"])
+        self.log("=== DUMP CHECK (offline) ===")
+        for ln in lines:
+            self.log("  " + ln)
+        messagebox.showinfo("Dump check", "\n".join(lines))
+
+    def do_compare_chip(self):
+        """STEP 2b: read the connected chip and diff it against the dump.
+
+        Read-only - nothing is written. Shows whether the chip already
+        matches the dump and whether an EPROM write is even possible."""
+        src = self._need_src()
+        if not src or not self._need_conn():
             return
 
-        src = {"rom": rom, "data": data, "stat": stat}
-        self._set_clone_src(src, f"source: file  {path}")
-        self.log(f"Clone dump loaded: {path}")
+        def job():
+            self.log("=== COMPARE dump vs chip (read-only) ===")
+            rom_t, t_data, t_stat = self._read_chip_full()
+            s_data, s_stat = src["data"], src["stat"]
+            same_rom = src.get("rom") and rom_t == src["rom"]
+            diff = [i for i in range(128) if t_data[i] != s_data[i]]
+            blocked = [i for i in range(128)
+                       if (t_data[i] & s_data[i]) != s_data[i]]
+            sdiff = [a for a in range(7) if t_stat[a] != s_stat[a]]
+            self.log(f"Chip ROM  : {rom_t}"
+                     + ("  (SAME chip as dump source!)" if same_rom else ""))
+            self.log(f"Dump ROM  : {src.get('rom') or 'unknown'}")
+            self.log(f"Data      : {128 - len(diff)}/128 bytes identical, "
+                     f"{len(diff)} differ")
+            if diff:
+                for off in diff[:16]:
+                    self.log(f"   {off:02X}h: chip {t_data[off]:02X}  "
+                             f"dump {s_data[off]:02X}"
+                             + ("  <- NOT writable (needs 0\u21921)"
+                                if off in blocked else "  (writable 1\u21920)"))
+                if len(diff) > 16:
+                    self.log(f"   ... and {len(diff) - 16} more")
+            self.log(f"Status    : bytes differing (00-06): "
+                     + (", ".join(f"{a:02X}h" for a in sdiff) or "none"))
+            if not diff and not sdiff:
+                verdict = ("Chip data+status already IDENTICAL to the dump. "
+                           "Nothing to write.")
+            elif blocked:
+                verdict = (f"{len(blocked)} byte(s) need bits 0\u21921 - "
+                           "IMPOSSIBLE on EPROM. Use a fresh blank chip.")
+            else:
+                verdict = (f"{len(diff)} data byte(s) + {len(sdiff)} status "
+                           "byte(s) can be programmed (all changes are "
+                           "1\u21920). Ready for step 4 WRITE.")
+            self.log("Verdict   : " + verdict)
+            self.after(0, lambda: messagebox.showinfo(
+                "Compare dump vs chip",
+                f"Chip ROM : {rom_t}\n"
+                f"Dump ROM : {src.get('rom') or 'unknown'}\n\n"
+                f"Data  : {128 - len(diff)}/128 identical, {len(diff)} "
+                f"differ, {len(blocked)} unwritable\n"
+                f"Status: {len(sdiff)} byte(s) differ\n\n{verdict}"))
+        self._run(job)
+
+    def do_edit_hex(self):
+        """STEP 3: edit the loaded dump's 128 data bytes in a hex editor."""
+        src = self._need_src()
+        if not src:
+            return
+        win = tk.Toplevel(self)
+        win.title("Edit hex - 128-byte data of loaded dump")
+        win.geometry("760x420")
+        ttk.Label(win, text="Edit the hex bytes below (offsets and |ascii| "
+                            "columns are ignored on save). Must remain "
+                            "exactly 128 bytes.").pack(anchor="w",
+                                                       padx=8, pady=6)
+        txt = scrolledtext.ScrolledText(win, font=("Consolas", 10), height=12)
+        txt.pack(fill="both", expand=True, padx=8, pady=4)
+        txt.insert("end", hexdump(src["data"]))
+
+        info = ttk.Label(win, text="", foreground="#a00000")
+        info.pack(anchor="w", padx=8)
+
+        def apply():
+            try:
+                data = parse_hexdump(txt.get("1.0", "end"))
+                if len(data) != 128:
+                    raise ValueError(f"got {len(data)} bytes, need 128")
+            except ValueError as e:
+                info.config(text=f"Parse error: {e}")
+                return
+            changes = [i for i in range(128) if data[i] != src["data"][i]]
+            src["data"] = data
+            self._set_clone_src(src, "source: edited dump (unsaved)")
+            self.log(f"Hex edit applied: {len(changes)} byte(s) changed"
+                     + (" at " + ", ".join(f"{i:02X}h" for i in changes[:12])
+                        + (" ..." if len(changes) > 12 else "")
+                        if changes else ""))
+            # warn if edit broke the page CRC scheme
+            for p in range(4):
+                a = p * 32
+                calc = crc8_dallas(data[a:a + 31])
+                if any(a <= i <= a + 31 for i in changes) \
+                        and calc != data[a + 31]:
+                    self.log(f"WARNING: page {p} CRC now {data[a+31]:02X}, "
+                             f"expected {calc:02X} - host may reject! "
+                             f"(set byte {a+31:02X}h = {calc:02X})")
+            win.destroy()
+
+        def fix_crcs():
+            try:
+                data = bytearray(parse_hexdump(txt.get("1.0", "end")))
+                if len(data) != 128:
+                    raise ValueError(f"got {len(data)} bytes, need 128")
+            except ValueError as e:
+                info.config(text=f"Parse error: {e}")
+                return
+            fixed = []
+            for p in range(4):
+                a = p * 32
+                calc = crc8_dallas(bytes(data[a:a + 31]))
+                if data[a + 31] != calc:
+                    data[a + 31] = calc
+                    fixed.append(p)
+            txt.delete("1.0", "end")
+            txt.insert("end", hexdump(bytes(data)))
+            info.config(text=("Page CRCs fixed: "
+                              + ", ".join(str(p) for p in fixed))
+                        if fixed else "All page CRCs already correct.")
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=8, pady=8)
+        ttk.Button(btns, text="Apply changes", command=apply)\
+            .pack(side="left")
+        ttk.Button(btns, text="Recalculate page CRCs", command=fix_crcs)\
+            .pack(side="left", padx=8)
+        ttk.Button(btns, text="Cancel", command=win.destroy)\
+            .pack(side="left", padx=8)
+
+    def do_write_loaded(self):
+        """STEP 4: write the loaded (possibly edited) dump to the chip."""
+        src = self._need_src()
+        if not src or not self._need_conn():
+            return
+        data, stat, rom = src["data"], src["stat"], src.get("rom", "")
         used = sum(1 for b in data if b != 0xFF)
         stat_hex = " ".join(f"{b:02X}" for b in stat)
         if not messagebox.askokcancel(
-                "Write clone dump to chip",
-                f"Loaded clone dump:\n\n  ROM of source: {rom or 'unknown'}\n"
+                "Write loaded dump to chip",
+                f"Write the CURRENTLY LOADED dump to the connected chip?\n\n"
+                f"  Source ROM: {rom or 'unknown'}\n"
                 f"  Data  : 128 bytes ({used} != FF)\n"
                 f"  Status: {stat_hex}\n\n"
-                "Make sure the NEW (blank) chip is connected, then click OK "
-                "to burn it.\n\nWriting is PERMANENT (EPROM, bits only go "
-                "1\u21920).", icon="warning"):
-            self.log("Clone dump write cancelled.")
+                "Make sure the TARGET (blank) chip is connected.\n\n"
+                "Writing is PERMANENT (EPROM, bits only go 1\u21920).",
+                icon="warning"):
+            self.log("Write cancelled.")
             return
         self._run(lambda: self._clone_write_from(src))
+
+    def do_rebind(self):
+        """Re-personalize the loaded dump to the TARGET chip's ROM ID.
+
+        For hosts that bind data to the chip's own ROM ID (embedded serial
+        + page CRCs): reads the target chip's ROM, replaces the old serial
+        inside the data and fixes the page CRCs. WRITE is still a separate
+        step."""
+        src = self._need_src()
+        if not src:
+            return
+        if not src.get("rom"):
+            messagebox.showinfo(
+                "No source ROM", "This dump has no source ROM ID, so the "
+                "embedded serial cannot be located automatically.\nUse "
+                "'Edit hex' to patch the bytes manually.")
+            return
+        if not self._need_conn():
+            return
+
+        def job():
+            self.log("=== REBIND: reading TARGET chip ROM ID ===")
+            ok, p, _ = self.bridge.command("ROM")
+            if not ok:
+                raise RuntimeError(f"read target ROM: {p}")
+            rom_t = p.split()[1]
+            if rom_t == src["rom"]:
+                raise RuntimeError("Target ROM equals the dump's source ROM "
+                                   "- the ORIGINAL chip is still connected!")
+            new_data, rep = rebind_data(src["data"], src["rom"], rom_t)
+            for ln in rep:
+                self.log("  " + ln)
+            if new_data == src["data"]:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Rebind", "No embedded ROM serial found - data "
+                    "unchanged.\nIf the host still rejects the clone, the "
+                    "binding uses a scheme this tool doesn't know; use the "
+                    "emulator instead."))
+                return
+            src["data"] = new_data
+            src["rebound_to"] = rom_t
+            self.after(0, lambda: (
+                self._set_clone_src(src, f"source: dump REBOUND to target "
+                                         f"ROM {rom_t}"),
+                messagebox.showinfo(
+                    "Rebind done (nothing written yet)",
+                    f"Data re-personalized for target chip\n{rom_t}\n\n"
+                    + "\n".join(rep) +
+                    "\n\nCheck the Data memory tab, then use "
+                    "'4\u20e3 WRITE to chip' to burn it.")))
+        self._run(job)
 
     def do_emulator_sketch(self):
         """Generate a DS2502 emulator Arduino sketch from a clone dump."""

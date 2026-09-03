@@ -46,10 +46,20 @@ def load_dump(path):
         stat = bytes.fromhex(j.get("status", "FF" * 7 + "00"))
         rom = bytes.fromhex(j["rom"]) if j.get("rom") else b""
     except (UnicodeDecodeError, json.JSONDecodeError):
-        if len(raw) != 128:
+        if len(raw) == 128:
+            data, stat, rom = raw, bytes([0xFF] * 7 + [0x00]), b""
+        elif len(raw) == 136:
+            # reader-tool format: 128 B data + 8 B ROM trailer (or ROM header)
+            head, tail = raw[:8], raw[128:]
+            if crc8(tail[:7]) == tail[7] and tail[0] != 0xFF:
+                data, stat, rom = raw[:128], bytes([0xFF] * 7 + [0x00]), tail
+            elif crc8(head[:7]) == head[7] and head[0] != 0xFF:
+                data, stat, rom = raw[8:], bytes([0xFF] * 7 + [0x00]), head
+            else:
+                data, stat, rom = raw[:128], raw[128:], b""
+        else:
             raise ValueError(f"{path}: not a clone dump and not a "
-                             f"128-byte bin (size {len(raw)})")
-        data, stat, rom = raw, bytes([0xFF] * 7 + [0x00]), b""
+                             f"128/136-byte bin (size {len(raw)})")
     if len(data) != 128 or len(stat) != 8:
         raise ValueError(f"bad lengths: data {len(data)} B (need 128), "
                          f"status {len(stat)} B (need 8)")
